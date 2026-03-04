@@ -18,27 +18,41 @@ import { Activity, Gauge, Layers, Zap } from "lucide-react";
 /**
  * Mock UI dashboard for: AI-Based Auto-Scaling for a Cloud Web App
  *
- * - Generates dynamic metrics every random 5–10s
- * - Occasionally produces sudden traffic spikes
- * - Shows time-series charts + current KPIs + autoscaling state
+ * ✅ Adds a “Traditional (threshold) vs Predictive” comparison:
+ * - Simulates BOTH strategies in parallel on the same workload point
+ * - Shows side-by-side outcomes (p95, errors, cost, SLA risk)
+ * - Still lets you toggle which strategy is the “active” one for KPI cards + state
  *
- * Drop this into a Next.js page (e.g., app/dashboard/page.tsx) as a client component.
  * Requirements:
  *   npm i recharts lucide-react
- *
- * Notes:
- * - Fixes Next.js hydration issues by generating random/time-based data only after mount.
- * - No shadcn dependencies. Tailwind optional (uses Tailwind classes).
  */
 
 type Point = {
   t: string;
   rps: number;
+
+  // Active (selected mode) values used by KPI cards + right chart
   p95: number;
   cost: number;
   instances: number;
   cpu: number;
   errors: number;
+
+  // Parallel simulations for comparison
+  inst_threshold: number;
+  inst_predictive: number;
+
+  cpu_threshold: number;
+  cpu_predictive: number;
+
+  p95_threshold: number;
+  p95_predictive: number;
+
+  errors_threshold: number;
+  errors_predictive: number;
+
+  cost_threshold: number;
+  cost_predictive: number;
 };
 
 type EventItem = {
@@ -90,8 +104,42 @@ function pillClass(kind: "default" | "warn" | "danger") {
   }
 }
 
+function simulateMetrics(rps: number, instances: number) {
+  const loadPerInstance = rps / Math.max(1, instances);
+
+  const cpu = clamp(18 + loadPerInstance * 0.55 + randFloat(-6, 6), 5, 98);
+
+  const p95 = Math.round(
+    clamp(
+      110 + cpu * 2.3 + Math.max(0, cpu - 70) * 7.5 + randFloat(-25, 25),
+      80,
+      2200,
+    ),
+  );
+
+  const errors = clamp(
+    (Math.max(0, cpu - 80) / 30) * 2 +
+      (Math.max(0, p95 - 800) / 1200) * 3 +
+      randFloat(0, 0.4),
+    0,
+    8,
+  );
+
+  return { cpu, p95, errors };
+}
+
+function estimateCost(instances: number, spikeMult: number) {
+  return clamp(
+    0.05 +
+      instances * 0.06 +
+      (spikeMult > 1 ? 0.03 : 0) +
+      randFloat(-0.01, 0.01),
+    0.05,
+    1.5,
+  );
+}
+
 export default function MockAutoscalingDashboardTS() {
-  // Hydration fix: render placeholder on server, then mount client-only data
   const [mounted, setMounted] = useState(false);
 
   const [mode, setMode] = useState<"threshold" | "predictive">("predictive");
@@ -99,13 +147,13 @@ export default function MockAutoscalingDashboardTS() {
   const [spikeChance, setSpikeChance] = useState(18); // % per tick
   const [windowSize, setWindowSize] = useState(60); // points
 
-  const baseRef = useRef({
-    rps: 55,
-    cpu: 32,
-    instances: 2,
-    cost: 0.12,
-    p95: 180,
-    errors: 0.2,
+  // Baseline drift driver (workload only)
+  const baseRef = useRef({ rps: 55 });
+
+  // Parallel simulation state
+  const simRef = useRef({
+    inst_threshold: 2,
+    inst_predictive: 2,
   });
 
   const [spikeState, setSpikeState] = useState<SpikeState>({
@@ -117,7 +165,7 @@ export default function MockAutoscalingDashboardTS() {
   const [events, setEvents] = useState<EventItem[]>([]);
   const [series, setSeries] = useState<Point[]>([]);
 
-  // Use refs to avoid stale closures / re-scheduling loops
+  // Refs to avoid stale closures
   const modeRef = useRef(mode);
   const runningRef = useRef(running);
   const spikeChanceRef = useRef(spikeChance);
@@ -149,7 +197,7 @@ export default function MockAutoscalingDashboardTS() {
     setEvents((prev) => [{ ts, kind, msg }, ...prev].slice(0, 8));
   };
 
-  // Mount + seed initial data on client only (no Math.random() during SSR)
+  // Mount + seed on client only
   useEffect(() => {
     setMounted(true);
 
@@ -160,17 +208,35 @@ export default function MockAutoscalingDashboardTS() {
       seed.push({
         t: formatTime(t),
         rps: 45,
+
+        // active defaults
         p95: 180,
         cost: 0.12,
         instances: 2,
         cpu: 30,
         errors: 0.2,
+
+        // parallel
+        inst_threshold: 2,
+        inst_predictive: 2,
+
+        cpu_threshold: 30,
+        cpu_predictive: 30,
+
+        p95_threshold: 180,
+        p95_predictive: 180,
+
+        errors_threshold: 0.2,
+        errors_predictive: 0.2,
+
+        cost_threshold: 0.12,
+        cost_predictive: 0.12,
       });
     }
     setSeries(seed);
   }, []);
 
-  // Main scheduler: random 5–10s updates, safe against hydration + stale closures
+  // Main scheduler: random 5–10s updates
   useEffect(() => {
     if (!mounted) return;
 
@@ -178,6 +244,7 @@ export default function MockAutoscalingDashboardTS() {
 
     const scheduleNext = () => {
       const ms = randInt(5000, 10000);
+
       timeoutId = setTimeout(() => {
         if (!runningRef.current) {
           scheduleNext();
@@ -185,7 +252,6 @@ export default function MockAutoscalingDashboardTS() {
         }
 
         const now = Date.now();
-        const base = baseRef.current;
 
         // Spike handling
         const st = spikeStateRef.current;
@@ -224,105 +290,117 @@ export default function MockAutoscalingDashboardTS() {
           }
         }
 
-        // Natural baseline drift
-        base.rps = clamp(base.rps + randFloat(-6, 6), 25, 120);
-
-        // Apply spike
-        const rps = Math.round(base.rps * spikeMult);
-
-        // Simulate CPU & latency
-        const loadPerInstance = rps / Math.max(1, base.instances);
-        const cpu = clamp(
-          18 + loadPerInstance * 0.55 + randFloat(-6, 6),
-          5,
-          98,
+        // Workload drift
+        baseRef.current.rps = clamp(
+          baseRef.current.rps + randFloat(-6, 6),
+          25,
+          120,
         );
-
-        const p95 = Math.round(
-          clamp(
-            110 + cpu * 2.3 + Math.max(0, cpu - 70) * 7.5 + randFloat(-25, 25),
-            80,
-            2200,
-          ),
-        );
-
-        const errors = clamp(
-          (Math.max(0, cpu - 80) / 30) * 2 +
-            (Math.max(0, p95 - 800) / 1200) * 3 +
-            randFloat(0, 0.4),
-          0,
-          8,
-        );
-
-        // Scaling logic
-        let desiredInstances = base.instances;
-        const thresholdUp = 70;
-        const thresholdDown = 35;
+        const rps = Math.round(baseRef.current.rps * spikeMult);
 
         const last = seriesRef.current[seriesRef.current.length - 1];
         const recentDelta = last ? rps - last.rps : 0;
         const predictedHigh = spikeMult > 1 || recentDelta > 60;
 
-        const currentMode = modeRef.current;
+        // Scaling thresholds
+        const thresholdUp = 70;
+        const thresholdDown = 35;
 
-        if (currentMode === "predictive") {
-          if (predictedHigh && base.instances < 10) {
-            desiredInstances = clamp(base.instances + 2, 1, 12);
-          } else if (cpu > thresholdUp && base.instances < 12) {
-            desiredInstances = clamp(base.instances + 1, 1, 12);
-          } else if (
-            cpu < thresholdDown &&
-            spikeMult === 1 &&
-            base.instances > 2
-          ) {
-            desiredInstances = clamp(base.instances - 1, 1, 12);
-          }
-        } else {
-          if (cpu > thresholdUp && base.instances < 12) {
-            desiredInstances = clamp(base.instances + 1, 1, 12);
-          } else if (
-            cpu < thresholdDown &&
-            spikeMult === 1 &&
-            base.instances > 2
-          ) {
-            desiredInstances = clamp(base.instances - 1, 1, 12);
-          }
+        // --- Parallel simulate THRESHOLD (traditional) ---
+        let instT = simRef.current.inst_threshold;
+
+        const mT1 = simulateMetrics(rps, instT);
+        let desiredT = instT;
+
+        if (mT1.cpu > thresholdUp && instT < 12) {
+          desiredT = clamp(instT + 1, 1, 12);
+        } else if (mT1.cpu < thresholdDown && spikeMult === 1 && instT > 2) {
+          desiredT = clamp(instT - 1, 1, 12);
         }
 
-        if (desiredInstances !== base.instances) {
+        if (desiredT !== instT) {
           logEvent(
             "scale",
-            `${currentMode === "predictive" ? "Predictive" : "Threshold"} scaling: ${
-              base.instances
-            } → ${desiredInstances} instances`,
+            `Threshold scaling: ${instT} → ${desiredT} instances`,
           );
-          base.instances = desiredInstances;
+          instT = desiredT;
         }
 
-        // Cost estimate
-        const cost = clamp(
-          0.05 +
-            base.instances * 0.06 +
-            (spikeMult > 1 ? 0.03 : 0) +
-            randFloat(-0.01, 0.01),
-          0.05,
-          1.5,
-        );
+        const mT2 = simulateMetrics(rps, instT);
+        const costT = estimateCost(instT, spikeMult);
 
-        // Commit
-        base.cpu = cpu;
-        base.p95 = p95;
-        base.cost = cost;
-        base.errors = errors;
+        // --- Parallel simulate PREDICTIVE (AI) ---
+        let instP = simRef.current.inst_predictive;
+
+        const mP1 = simulateMetrics(rps, instP);
+        let desiredP = instP;
+
+        if (predictedHigh && instP < 10) {
+          desiredP = clamp(instP + 2, 1, 12); // proactive jump
+        } else if (mP1.cpu > thresholdUp && instP < 12) {
+          desiredP = clamp(instP + 1, 1, 12);
+        } else if (mP1.cpu < thresholdDown && spikeMult === 1 && instP > 2) {
+          desiredP = clamp(instP - 1, 1, 12);
+        }
+
+        if (desiredP !== instP) {
+          logEvent(
+            "scale",
+            `Predictive scaling: ${instP} → ${desiredP} instances`,
+          );
+          instP = desiredP;
+        }
+
+        const mP2 = simulateMetrics(rps, instP);
+        const costP = estimateCost(instP, spikeMult);
+
+        // Commit parallel instance state
+        simRef.current.inst_threshold = instT;
+        simRef.current.inst_predictive = instP;
+
+        // Choose active mode (what KPI cards show)
+        const activeMode = modeRef.current;
+        const active =
+          activeMode === "predictive"
+            ? {
+                inst: instP,
+                cpu: mP2.cpu,
+                p95: mP2.p95,
+                errors: mP2.errors,
+                cost: costP,
+              }
+            : {
+                inst: instT,
+                cpu: mT2.cpu,
+                p95: mT2.p95,
+                errors: mT2.errors,
+                cost: costT,
+              };
 
         const point: Point = {
           t: formatTime(new Date()),
           rps,
-          p95,
-          cost: Number(cost.toFixed(2)),
-          instances: base.instances,
-          cpu: Math.round(cpu),
-          errors: Number(errors.toFixed(2)),
+
+          instances: active.inst,
+          cpu: Math.round(active.cpu),
+          p95: active.p95,
+          errors: Number(active.errors.toFixed(2)),
+          cost: Number(active.cost.toFixed(2)),
+
+          inst_threshold: instT,
+          inst_predictive: instP,
+
+          cpu_threshold: Math.round(mT2.cpu),
+          cpu_predictive: Math.round(mP2.cpu),
+
+          p95_threshold: mT2.p95,
+          p95_predictive: mP2.p95,
+
+          errors_threshold: Number(mT2.errors.toFixed(2)),
+          errors_predictive: Number(mP2.errors.toFixed(2)),
+
+          cost_threshold: Number(costT.toFixed(2)),
+          cost_predictive: Number(costP.toFixed(2)),
         };
 
         setSeries((prev) => {
@@ -353,6 +431,51 @@ export default function MockAutoscalingDashboardTS() {
       return { label: "Spike Active", kind: "danger" as const };
     return { label: "Normal", kind: "default" as const };
   }, [running, spikeState.active]);
+
+  const comparison = useMemo(() => {
+    if (!series.length) return null;
+
+    const slice = series.slice(
+      Math.max(0, series.length - Math.min(windowSize, 60)),
+    );
+
+    const avg = (arr: number[]) =>
+      arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+
+    const p95T = avg(slice.map((p) => p.p95_threshold));
+    const p95P = avg(slice.map((p) => p.p95_predictive));
+
+    const errT = avg(slice.map((p) => p.errors_threshold));
+    const errP = avg(slice.map((p) => p.errors_predictive));
+
+    const costT = avg(slice.map((p) => p.cost_threshold));
+    const costP = avg(slice.map((p) => p.cost_predictive));
+
+    const slaRiskT = slice.filter(
+      (p) => p.p95_threshold > 800 || p.errors_threshold > 1,
+    ).length;
+    const slaRiskP = slice.filter(
+      (p) => p.p95_predictive > 800 || p.errors_predictive > 1,
+    ).length;
+
+    const benefitLatency = p95T > 0 ? ((p95T - p95P) / p95T) * 100 : 0;
+    const benefitErrors = errT > 0 ? ((errT - errP) / errT) * 100 : 0;
+    const costDelta = costP - costT;
+
+    return {
+      p95T,
+      p95P,
+      errT,
+      errP,
+      costT,
+      costP,
+      slaRiskT,
+      slaRiskP,
+      benefitLatency,
+      benefitErrors,
+      costDelta,
+    };
+  }, [series, windowSize]);
 
   if (!mounted) {
     return (
@@ -427,7 +550,7 @@ export default function MockAutoscalingDashboardTS() {
           </div>
         </div>
 
-        {/* KPI cards */}
+        {/* KPI cards (active mode) */}
         <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
           <KpiCard
             icon={<Activity className="h-4 w-4" />}
@@ -455,6 +578,115 @@ export default function MockAutoscalingDashboardTS() {
           />
         </div>
 
+        {/* Comparison panel (traditional vs predictive benefit) */}
+        <div className="rounded-2xl border bg-white p-4 shadow-sm md:p-6">
+          <div className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
+            <div>
+              <h2 className="text-base font-semibold">
+                Traditional vs Predictive (Live Comparison)
+              </h2>
+              <p className="mt-1 text-sm text-gray-600">
+                Both strategies are simulated on the same traffic. Predictive
+                tries to scale earlier when a spike is likely.
+              </p>
+            </div>
+            {comparison ? (
+              <div className="text-xs text-gray-600">
+                Window: last ~{Math.min(windowSize, 60)} points
+              </div>
+            ) : null}
+          </div>
+
+          {!comparison ? (
+            <p className="mt-4 text-sm text-gray-600">Collecting data…</p>
+          ) : (
+            <>
+              <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-3">
+                <div className="rounded-2xl border p-4">
+                  <div className="text-xs font-medium text-gray-600">
+                    Traditional (Threshold)
+                  </div>
+                  <div className="mt-3 space-y-2 text-sm">
+                    <Row
+                      label="Avg p95"
+                      value={`${Math.round(comparison.p95T)} ms`}
+                    />
+                    <Row
+                      label="Avg errors"
+                      value={`${comparison.errT.toFixed(2)}%`}
+                    />
+                    <Row
+                      label="SLA risk count"
+                      value={`${comparison.slaRiskT}`}
+                    />
+                    <Row
+                      label="Avg cost"
+                      value={`$${comparison.costT.toFixed(2)}/hr`}
+                    />
+                  </div>
+                </div>
+
+                <div className="rounded-2xl border p-4">
+                  <div className="text-xs font-medium text-gray-600">
+                    Predictive (AI)
+                  </div>
+                  <div className="mt-3 space-y-2 text-sm">
+                    <Row
+                      label="Avg p95"
+                      value={`${Math.round(comparison.p95P)} ms`}
+                    />
+                    <Row
+                      label="Avg errors"
+                      value={`${comparison.errP.toFixed(2)}%`}
+                    />
+                    <Row
+                      label="SLA risk count"
+                      value={`${comparison.slaRiskP}`}
+                    />
+                    <Row
+                      label="Avg cost"
+                      value={`$${comparison.costP.toFixed(2)}/hr`}
+                    />
+                  </div>
+                </div>
+
+                <div className="rounded-2xl border p-4">
+                  <div className="text-xs font-medium text-gray-600">
+                    Benefit Summary
+                  </div>
+                  <div className="mt-3 space-y-2 text-sm">
+                    <Row
+                      label="Latency improvement"
+                      value={`${comparison.benefitLatency >= 0 ? "+" : ""}${comparison.benefitLatency.toFixed(
+                        0,
+                      )}%`}
+                    />
+                    <Row
+                      label="Errors improvement"
+                      value={`${comparison.benefitErrors >= 0 ? "+" : ""}${comparison.benefitErrors.toFixed(
+                        0,
+                      )}%`}
+                    />
+                    <Row
+                      label="SLA risk reduction"
+                      value={`${Math.max(0, comparison.slaRiskT - comparison.slaRiskP)}`}
+                    />
+                    <Row
+                      label="Cost tradeoff"
+                      value={`${comparison.costDelta >= 0 ? "+" : ""}$${comparison.costDelta.toFixed(2)}/hr`}
+                    />
+                  </div>
+                  <p className="mt-3 text-xs text-gray-600">
+                    Predictive usually reduces p95/errors during spikes by
+                    scaling earlier, but may cost slightly more when it
+                    over-prepares.
+                  </p>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+
         {/* Charts */}
         <div className="rounded-2xl border bg-white p-4 shadow-sm md:p-6">
           <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
@@ -463,8 +695,8 @@ export default function MockAutoscalingDashboardTS() {
                 Traffic & Scaling Over Time
               </h2>
               <p className="mt-1 text-sm text-gray-600">
-                Compare reactive (threshold) vs proactive (predictive) scaling
-                during sudden spikes.
+                Top chart: RPS + instance counts for both strategies. Bottom
+                chart: active mode quality metrics.
               </p>
             </div>
 
@@ -508,6 +740,7 @@ export default function MockAutoscalingDashboardTS() {
           </div>
 
           <div className="mt-4 grid grid-cols-1 gap-6 lg:grid-cols-2">
+            {/* RPS + BOTH instance strategies */}
             <div className="h-72 rounded-xl border p-3">
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart
@@ -526,17 +759,25 @@ export default function MockAutoscalingDashboardTS() {
                     fillOpacity={0.15}
                     strokeWidth={2}
                   />
-                  <Area
+                  <Line
                     type="monotone"
-                    dataKey="instances"
-                    name="Instances"
-                    fillOpacity={0.12}
+                    dataKey="inst_threshold"
+                    name="Instances (Threshold)"
                     strokeWidth={2}
+                    dot={false}
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="inst_predictive"
+                    name="Instances (Predictive)"
+                    strokeWidth={2}
+                    dot={false}
                   />
                 </AreaChart>
               </ResponsiveContainer>
             </div>
 
+            {/* Active mode quality metrics */}
             <div className="h-72 rounded-xl border p-3">
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart
@@ -551,21 +792,21 @@ export default function MockAutoscalingDashboardTS() {
                   <Line
                     type="monotone"
                     dataKey="p95"
-                    name="p95 (ms)"
+                    name="p95 (ms) [active]"
                     strokeWidth={2}
                     dot={false}
                   />
                   <Line
                     type="monotone"
                     dataKey="cpu"
-                    name="CPU (%)"
+                    name="CPU (%) [active]"
                     strokeWidth={2}
                     dot={false}
                   />
                   <Line
                     type="monotone"
                     dataKey="errors"
-                    name="Errors (%)"
+                    name="Errors (%) [active]"
                     strokeWidth={2}
                     dot={false}
                   />
@@ -647,7 +888,7 @@ export default function MockAutoscalingDashboardTS() {
 
 function Row({ label, value }: { label: string; value: string }) {
   return (
-    <div className="flex items-center justify-between">
+    <div className="flex items-center justify-between gap-3">
       <span className="text-gray-600">{label}</span>
       <span className="font-medium">{value}</span>
     </div>
