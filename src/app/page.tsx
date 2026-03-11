@@ -18,10 +18,18 @@ import { Activity, Gauge, Layers, Zap } from "lucide-react";
 /**
  * Mock UI dashboard for: AI-Based Auto-Scaling for a Cloud Web App
  *
- * ✅ Adds a “Traditional (threshold) vs Predictive” comparison:
- * - Simulates BOTH strategies in parallel on the same workload point
- * - Shows side-by-side outcomes (p95, errors, cost, SLA risk)
- * - Still lets you toggle which strategy is the “active” one for KPI cards + state
+ * ✅ Features:
+ * - Random 5–10s updates
+ * - Occasional sudden traffic spikes
+ * - Simulates BOTH strategies in parallel:
+ *    1) Traditional (threshold/reactive)
+ *    2) Predictive (proactive/AI)
+ * - Toggle chooses which strategy is "active" for KPI cards + active chart
+ * - Adds "Total benefit in last 1 hour" summary:
+ *    - SLA risk reduction (count)
+ *    - Avg latency improvement (%)
+ *    - Avg error improvement (%)
+ *    - Estimated compute spend delta ($)
  *
  * Requirements:
  *   npm i recharts lucide-react
@@ -29,9 +37,10 @@ import { Activity, Gauge, Layers, Zap } from "lucide-react";
 
 type Point = {
   t: string;
+  tsMs: number; // ✅ real timestamp for "last 1 hour" calculations
   rps: number;
 
-  // Active (selected mode) values used by KPI cards + right chart
+  // Active (selected mode) values used by KPI cards + active chart
   p95: number;
   cost: number;
   instances: number;
@@ -139,6 +148,18 @@ function estimateCost(instances: number, spikeMult: number) {
   );
 }
 
+function formatSignedPct(x: number) {
+  const v = Number.isFinite(x) ? x : 0;
+  const sign = v >= 0 ? "+" : "";
+  return `${sign}${v.toFixed(0)}%`;
+}
+
+function formatSignedUsd(x: number) {
+  const v = Number.isFinite(x) ? x : 0;
+  const sign = v >= 0 ? "+" : "";
+  return `${sign}$${v.toFixed(2)}`;
+}
+
 export default function MockAutoscalingDashboardTS() {
   const [mounted, setMounted] = useState(false);
 
@@ -207,6 +228,7 @@ export default function MockAutoscalingDashboardTS() {
       const t = new Date(now.getTime() - i * 1000);
       seed.push({
         t: formatTime(t),
+        tsMs: t.getTime(),
         rps: 45,
 
         // active defaults
@@ -251,7 +273,7 @@ export default function MockAutoscalingDashboardTS() {
           return;
         }
 
-        const now = Date.now();
+        const nowMs = Date.now();
 
         // Spike handling
         const st = spikeStateRef.current;
@@ -263,7 +285,7 @@ export default function MockAutoscalingDashboardTS() {
 
           const nextSpike: SpikeState = {
             active: true,
-            endsAt: now + durationMs,
+            endsAt: nowMs + durationMs,
             mult,
           };
           spikeStateRef.current = nextSpike;
@@ -280,7 +302,7 @@ export default function MockAutoscalingDashboardTS() {
         const st2 = spikeStateRef.current;
 
         if (st2.active) {
-          if (now >= st2.endsAt) {
+          if (nowMs >= st2.endsAt) {
             const cleared: SpikeState = { active: false, endsAt: 0, mult: 1 };
             spikeStateRef.current = cleared;
             setSpikeState(cleared);
@@ -378,7 +400,8 @@ export default function MockAutoscalingDashboardTS() {
               };
 
         const point: Point = {
-          t: formatTime(new Date()),
+          t: formatTime(new Date(nowMs)),
+          tsMs: nowMs,
           rps,
 
           instances: active.inst,
@@ -432,6 +455,7 @@ export default function MockAutoscalingDashboardTS() {
     return { label: "Normal", kind: "default" as const };
   }, [running, spikeState.active]);
 
+  // Rolling comparison for display (short window ~ up to 60 points)
   const comparison = useMemo(() => {
     if (!series.length) return null;
 
@@ -476,6 +500,66 @@ export default function MockAutoscalingDashboardTS() {
       costDelta,
     };
   }, [series, windowSize]);
+
+  // ✅ Total benefit over last 1 hour (based on tsMs)
+  const lastHourBenefit = useMemo(() => {
+    if (!series.length) return null;
+
+    const now = Date.now();
+    const oneHourAgo = now - 60 * 60 * 1000;
+
+    const slice = series.filter((p) => p.tsMs >= oneHourAgo);
+
+    if (slice.length < 2) {
+      return {
+        points: 0,
+        hours: 0,
+        slaSaved: 0,
+        avgLatPct: 0,
+        avgErrPct: 0,
+        spendDelta: 0,
+      };
+    }
+
+    const minTs = slice[0]!.tsMs;
+    const maxTs = slice[slice.length - 1]!.tsMs;
+    const hours = Math.max(0.001, (maxTs - minTs) / 3600000);
+
+    const avg = (arr: number[]) =>
+      arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+
+    const p95T = avg(slice.map((p) => p.p95_threshold));
+    const p95P = avg(slice.map((p) => p.p95_predictive));
+
+    const errT = avg(slice.map((p) => p.errors_threshold));
+    const errP = avg(slice.map((p) => p.errors_predictive));
+
+    const avgCostT = avg(slice.map((p) => p.cost_threshold));
+    const avgCostP = avg(slice.map((p) => p.cost_predictive));
+
+    const slaRiskT = slice.filter(
+      (p) => p.p95_threshold > 800 || p.errors_threshold > 1,
+    ).length;
+    const slaRiskP = slice.filter(
+      (p) => p.p95_predictive > 800 || p.errors_predictive > 1,
+    ).length;
+
+    const avgLatPct = p95T > 0 ? ((p95T - p95P) / p95T) * 100 : 0;
+    const avgErrPct = errT > 0 ? ((errT - errP) / errT) * 100 : 0;
+
+    // Estimated spend delta over that covered time window:
+    // (avg $/hr predictive - avg $/hr threshold) * hours
+    const spendDelta = (avgCostP - avgCostT) * hours;
+
+    return {
+      points: slice.length,
+      hours,
+      slaSaved: Math.max(0, slaRiskT - slaRiskP),
+      avgLatPct,
+      avgErrPct,
+      spendDelta,
+    };
+  }, [series]);
 
   if (!mounted) {
     return (
@@ -578,7 +662,64 @@ export default function MockAutoscalingDashboardTS() {
           />
         </div>
 
-        {/* Comparison panel (traditional vs predictive benefit) */}
+        {/* ✅ Total benefit in last 1 hour */}
+        <div className="rounded-2xl border bg-white p-4 shadow-sm md:p-6">
+          <div className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
+            <div>
+              <h2 className="text-base font-semibold">
+                Total Benefit (Last 1 Hour)
+              </h2>
+              <p className="mt-1 text-sm text-gray-600">
+                Summary of predictive vs threshold outcomes over the last hour
+                of collected points.
+              </p>
+            </div>
+            <div className="text-xs text-gray-600">
+              Based on real timestamps (tsMs).
+            </div>
+          </div>
+
+          {!lastHourBenefit || lastHourBenefit.points < 2 ? (
+            <p className="mt-4 text-sm text-gray-600">
+              Not enough data yet for a full hour. Keep the dashboard running.
+            </p>
+          ) : (
+            <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-4">
+              <KpiCard
+                icon={<Layers className="h-4 w-4" />}
+                label="SLA risks avoided"
+                value={`${lastHourBenefit.slaSaved}`}
+                hint="(p95>800ms or errors>1%)"
+              />
+              <KpiCard
+                icon={<Gauge className="h-4 w-4" />}
+                label="Avg latency change"
+                value={formatSignedPct(lastHourBenefit.avgLatPct)}
+                hint="Predictive vs threshold"
+              />
+              <KpiCard
+                icon={<Activity className="h-4 w-4" />}
+                label="Avg errors change"
+                value={formatSignedPct(lastHourBenefit.avgErrPct)}
+                hint="Predictive vs threshold"
+              />
+              <KpiCard
+                icon={<Zap className="h-4 w-4" />}
+                label="Spend difference"
+                value={formatSignedUsd(lastHourBenefit.spendDelta)}
+                hint="($ over covered window)"
+              />
+            </div>
+          )}
+
+          <p className="mt-4 text-xs text-gray-600">
+            Interpretation: Positive latency/errors change means predictive is
+            better (lower). Spend difference may be positive because predictive
+            can scale earlier.
+          </p>
+        </div>
+
+        {/* Comparison panel (rolling) */}
         <div className="rounded-2xl border bg-white p-4 shadow-sm md:p-6">
           <div className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
             <div>
@@ -600,90 +741,83 @@ export default function MockAutoscalingDashboardTS() {
           {!comparison ? (
             <p className="mt-4 text-sm text-gray-600">Collecting data…</p>
           ) : (
-            <>
-              <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-3">
-                <div className="rounded-2xl border p-4">
-                  <div className="text-xs font-medium text-gray-600">
-                    Traditional (Threshold)
-                  </div>
-                  <div className="mt-3 space-y-2 text-sm">
-                    <Row
-                      label="Avg p95"
-                      value={`${Math.round(comparison.p95T)} ms`}
-                    />
-                    <Row
-                      label="Avg errors"
-                      value={`${comparison.errT.toFixed(2)}%`}
-                    />
-                    <Row
-                      label="SLA risk count"
-                      value={`${comparison.slaRiskT}`}
-                    />
-                    <Row
-                      label="Avg cost"
-                      value={`$${comparison.costT.toFixed(2)}/hr`}
-                    />
-                  </div>
+            <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-3">
+              <div className="rounded-2xl border p-4">
+                <div className="text-xs font-medium text-gray-600">
+                  Traditional (Threshold)
                 </div>
-
-                <div className="rounded-2xl border p-4">
-                  <div className="text-xs font-medium text-gray-600">
-                    Predictive (AI)
-                  </div>
-                  <div className="mt-3 space-y-2 text-sm">
-                    <Row
-                      label="Avg p95"
-                      value={`${Math.round(comparison.p95P)} ms`}
-                    />
-                    <Row
-                      label="Avg errors"
-                      value={`${comparison.errP.toFixed(2)}%`}
-                    />
-                    <Row
-                      label="SLA risk count"
-                      value={`${comparison.slaRiskP}`}
-                    />
-                    <Row
-                      label="Avg cost"
-                      value={`$${comparison.costP.toFixed(2)}/hr`}
-                    />
-                  </div>
-                </div>
-
-                <div className="rounded-2xl border p-4">
-                  <div className="text-xs font-medium text-gray-600">
-                    Benefit Summary
-                  </div>
-                  <div className="mt-3 space-y-2 text-sm">
-                    <Row
-                      label="Latency improvement"
-                      value={`${comparison.benefitLatency >= 0 ? "+" : ""}${comparison.benefitLatency.toFixed(
-                        0,
-                      )}%`}
-                    />
-                    <Row
-                      label="Errors improvement"
-                      value={`${comparison.benefitErrors >= 0 ? "+" : ""}${comparison.benefitErrors.toFixed(
-                        0,
-                      )}%`}
-                    />
-                    <Row
-                      label="SLA risk reduction"
-                      value={`${Math.max(0, comparison.slaRiskT - comparison.slaRiskP)}`}
-                    />
-                    <Row
-                      label="Cost tradeoff"
-                      value={`${comparison.costDelta >= 0 ? "+" : ""}$${comparison.costDelta.toFixed(2)}/hr`}
-                    />
-                  </div>
-                  <p className="mt-3 text-xs text-gray-600">
-                    Predictive usually reduces p95/errors during spikes by
-                    scaling earlier, but may cost slightly more when it
-                    over-prepares.
-                  </p>
+                <div className="mt-3 space-y-2 text-sm">
+                  <Row
+                    label="Avg p95"
+                    value={`${Math.round(comparison.p95T)} ms`}
+                  />
+                  <Row
+                    label="Avg errors"
+                    value={`${comparison.errT.toFixed(2)}%`}
+                  />
+                  <Row
+                    label="SLA risk count"
+                    value={`${comparison.slaRiskT}`}
+                  />
+                  <Row
+                    label="Avg cost"
+                    value={`$${comparison.costT.toFixed(2)}/hr`}
+                  />
                 </div>
               </div>
-            </>
+
+              <div className="rounded-2xl border p-4">
+                <div className="text-xs font-medium text-gray-600">
+                  Predictive (AI)
+                </div>
+                <div className="mt-3 space-y-2 text-sm">
+                  <Row
+                    label="Avg p95"
+                    value={`${Math.round(comparison.p95P)} ms`}
+                  />
+                  <Row
+                    label="Avg errors"
+                    value={`${comparison.errP.toFixed(2)}%`}
+                  />
+                  <Row
+                    label="SLA risk count"
+                    value={`${comparison.slaRiskP}`}
+                  />
+                  <Row
+                    label="Avg cost"
+                    value={`$${comparison.costP.toFixed(2)}/hr`}
+                  />
+                </div>
+              </div>
+
+              <div className="rounded-2xl border p-4">
+                <div className="text-xs font-medium text-gray-600">
+                  Benefit Summary
+                </div>
+                <div className="mt-3 space-y-2 text-sm">
+                  <Row
+                    label="Latency improvement"
+                    value={formatSignedPct(comparison.benefitLatency)}
+                  />
+                  <Row
+                    label="Errors improvement"
+                    value={formatSignedPct(comparison.benefitErrors)}
+                  />
+                  <Row
+                    label="SLA risk reduction"
+                    value={`${Math.max(0, comparison.slaRiskT - comparison.slaRiskP)}`}
+                  />
+                  <Row
+                    label="Cost tradeoff"
+                    value={formatSignedUsd(comparison.costDelta)}
+                  />
+                </div>
+                <p className="mt-3 text-xs text-gray-600">
+                  Predictive usually reduces p95/errors during spikes by scaling
+                  earlier, but may cost slightly more when it over-prepares.
+                </p>
+              </div>
+            </div>
           )}
         </div>
 
