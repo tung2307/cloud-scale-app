@@ -2,1030 +2,1096 @@
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
-  AreaChart,
+  Activity,
+  AlertTriangle,
+  ArrowDown,
+  ArrowUp,
+  Brain,
+  CheckCircle2,
+  CircleDollarSign,
+  Gauge,
+  Layers,
+  Pause,
+  Play,
+  RotateCcw,
+  Server,
+  ShieldCheck,
+  TrendingUp,
+  Zap,
+} from "lucide-react";
+import {
   Area,
+  AreaChart,
+  CartesianGrid,
+  Legend,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
   XAxis,
   YAxis,
-  Tooltip,
-  ResponsiveContainer,
-  CartesianGrid,
-  LineChart,
-  Line,
-  Legend,
 } from "recharts";
-import { Activity, Gauge, Layers, Zap } from "lucide-react";
 
-/**
- * Mock UI dashboard for: AI-Based Auto-Scaling for a Cloud Web App
- *
- * ✅ Features:
- * - Random 5–10s updates
- * - Occasional sudden traffic spikes
- * - Simulates BOTH strategies in parallel:
- *    1) Traditional (threshold/reactive)
- *    2) Predictive (proactive/AI)
- * - Toggle chooses which strategy is "active" for KPI cards + active chart
- * - Adds "Total benefit in last 1 hour" summary:
- *    - SLA risk reduction (count)
- *    - Avg latency improvement (%)
- *    - Avg error improvement (%)
- *    - Estimated compute spend delta ($)
- *
- * Requirements:
- *   npm i recharts lucide-react
- */
+type ModelName = "xgboost" | "random_forest";
+
+type MetricSample = {
+  requests: number;
+  response_time_ms: number;
+  node_cpu_millicores: number;
+  pod_cpu_millicores: number;
+  pod_mem_mi: number;
+  replicas: number;
+};
+
+type CloudWatchMetricResponse = {
+  timestamp: string;
+  requests: number;
+  response_time_ms: number;
+  cpu_percent: number;
+  memory_percent: number;
+  pod_cpu_millicores: number;
+  pod_mem_mi: number;
+  node_cpu_millicores: number;
+  replicas: number;
+  desired_replicas?: number;
+  available_replicas?: number;
+  source?: string;
+};
 
 type Point = {
   t: string;
-  tsMs: number; // ✅ real timestamp for "last 1 hour" calculations
+  tsMs: number;
   rps: number;
-
-  // Active (selected mode) values used by KPI cards + active chart
-  p95: number;
-  cost: number;
-  instances: number;
-  cpu: number;
-  errors: number;
-
-  // Parallel simulations for comparison
   inst_threshold: number;
   inst_predictive: number;
-
   cpu_threshold: number;
   cpu_predictive: number;
-
   p95_threshold: number;
   p95_predictive: number;
-
   errors_threshold: number;
   errors_predictive: number;
-
   cost_threshold: number;
   cost_predictive: number;
+  active_cpu: number;
+  active_p95: number;
+  active_errors: number;
+  active_instances: number;
+  active_cost: number;
+  memory_percent: number;
 };
 
 type EventItem = {
   ts: string;
-  kind: "spike" | "scale" | "note";
+  kind: "ai" | "threshold" | "cloudwatch" | "scale" | "note";
   msg: string;
 };
 
-type SpikeState = {
-  active: boolean;
-  endsAt: number;
-  mult: number;
+type PredictionResponse = {
+  recommended: number | null;
+  raw?: number;
+  modelUsed?: string;
 };
 
 function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n));
 }
 
-// Stable, locale-independent time string for SSR safety
 function formatTime(d: Date) {
-  const hh = String(d.getHours()).padStart(2, "0");
-  const mm = String(d.getMinutes()).padStart(2, "0");
-  const ss = String(d.getSeconds()).padStart(2, "0");
-  return `${hh}:${mm}:${ss}`;
+  return d.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
 }
 
-function randInt(min: number, max: number) {
-  return Math.floor(Math.random() * (max - min + 1)) + min;
+function formatPct(n: number) {
+  if (!Number.isFinite(n)) return "0%";
+  const sign = n > 0 ? "+" : "";
+  return `${sign}${n.toFixed(0)}%`;
 }
 
-function randFloat(min: number, max: number) {
-  return Math.random() * (max - min) + min;
+function formatUsd(n: number) {
+  if (!Number.isFinite(n)) return "$0.00";
+  const sign = n > 0 ? "+" : "";
+  return `${sign}$${n.toFixed(2)}`;
 }
 
-// Non-empty array pick (prevents undefined)
-function pick<T>(arr: readonly [T, ...T[]]): T {
-  const index = Math.floor(Math.random() * arr.length);
-  return arr[index] as T;
+function estimateCost(pods: number) {
+  return Number(clamp(0.06 + pods * 0.055, 0.06, 2).toFixed(2));
 }
 
-function pillClass(kind: "default" | "warn" | "danger") {
-  switch (kind) {
-    case "danger":
-      return "bg-red-100 text-red-800 border-red-200";
-    case "warn":
-      return "bg-yellow-100 text-yellow-900 border-yellow-200";
-    default:
-      return "bg-emerald-100 text-emerald-900 border-emerald-200";
-  }
-}
-
-function simulateMetrics(rps: number, instances: number) {
-  const loadPerInstance = rps / Math.max(1, instances);
-
-  const cpu = clamp(18 + loadPerInstance * 0.55 + randFloat(-6, 6), 5, 98);
-
-  const p95 = Math.round(
+function estimateErrors(cpu: number, p95: number) {
+  return Number(
     clamp(
-      110 + cpu * 2.3 + Math.max(0, cpu - 70) * 7.5 + randFloat(-25, 25),
-      80,
+      (Math.max(0, cpu - 82) / 26) * 2.4 + (Math.max(0, p95 - 850) / 1150) * 3,
+      0,
+      8,
+    ).toFixed(2),
+  );
+}
+
+function projectHealth(metric: CloudWatchMetricResponse, pods: number) {
+  const currentPods = Math.max(1, metric.replicas || 1);
+  const safePods = Math.max(1, pods);
+  const loadFactor = currentPods / safePods;
+
+  const projectedCpu = clamp(metric.cpu_percent * loadFactor, 2, 98);
+  const projectedP95 = Math.round(
+    clamp(
+      metric.response_time_ms * Math.max(0.7, loadFactor) +
+        Math.max(0, projectedCpu - 65) * 6,
+      50,
       2200,
     ),
   );
 
-  const errors = clamp(
-    (Math.max(0, cpu - 80) / 30) * 2 +
-      (Math.max(0, p95 - 800) / 1200) * 3 +
-      randFloat(0, 0.4),
-    0,
-    8,
-  );
-
-  return { cpu, p95, errors };
+  return {
+    cpu: Math.round(projectedCpu),
+    p95: projectedP95,
+    errors: estimateErrors(projectedCpu, projectedP95),
+  };
 }
 
-function estimateCost(instances: number, spikeMult: number) {
-  return clamp(
-    0.05 +
-      instances * 0.06 +
-      (spikeMult > 1 ? 0.03 : 0) +
-      randFloat(-0.01, 0.01),
-    0.05,
-    1.5,
-  );
+async function fetchCloudWatchMetrics(): Promise<CloudWatchMetricResponse | null> {
+  try {
+    const res = await fetch("/api/cloudwatch", { cache: "no-store" });
+    const data = await res.json();
+
+    if (!res.ok || data.error) {
+      console.warn("CloudWatch API error:", data.error ?? res.statusText);
+      return null;
+    }
+
+    return data as CloudWatchMetricResponse;
+  } catch (err) {
+    console.warn("CloudWatch API unreachable:", err);
+    return null;
+  }
 }
 
-function formatSignedPct(x: number) {
-  const v = Number.isFinite(x) ? x : 0;
-  const sign = v >= 0 ? "+" : "";
-  return `${sign}${v.toFixed(0)}%`;
+async function callPredictAPI(
+  history: MetricSample[],
+  model: ModelName,
+): Promise<PredictionResponse> {
+  try {
+    const res = await fetch("/api/predict", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ history, model }),
+    });
+
+    const data = await res.json();
+
+    if (!res.ok || data.error) {
+      console.warn("Predict API error:", data.error ?? res.statusText);
+      return { recommended: null };
+    }
+
+    return {
+      recommended: Number(data.recommended_replicas),
+      raw: Number(data.predicted_replicas_raw),
+      modelUsed: data.model_used,
+    };
+  } catch (err) {
+    console.warn("Predict API unreachable:", err);
+    return { recommended: null };
+  }
 }
 
-function formatSignedUsd(x: number) {
-  const v = Number.isFinite(x) ? x : 0;
-  const sign = v >= 0 ? "+" : "";
-  return `${sign}$${v.toFixed(2)}`;
+async function applyScale(replicas: number) {
+  try {
+    const res = await fetch("/api/scale", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ replicas }),
+    });
+
+    const data = await res.json();
+
+    if (!res.ok || data.error) {
+      console.warn("Scale API error:", data.error ?? res.statusText);
+      return null;
+    }
+
+    return data;
+  } catch (err) {
+    console.warn("Scale API unreachable:", err);
+    return null;
+  }
 }
 
-export default function MockAutoscalingDashboardTS() {
+export default function PredictiveAutoscalingDashboard() {
   const [mounted, setMounted] = useState(false);
-
-  const [mode, setMode] = useState<"threshold" | "predictive">("predictive");
   const [running, setRunning] = useState(true);
-  const [spikeChance, setSpikeChance] = useState(18); // % per tick
-  const [windowSize, setWindowSize] = useState(60); // points
-
-  // Baseline drift driver (workload only)
-  const baseRef = useRef({ rps: 55 });
-
-  // Parallel simulation state
-  const simRef = useRef({
-    inst_threshold: 2,
-    inst_predictive: 2,
-  });
-
-  const [spikeState, setSpikeState] = useState<SpikeState>({
-    active: false,
-    endsAt: 0,
-    mult: 1,
-  });
-
-  const [events, setEvents] = useState<EventItem[]>([]);
+  const [autoApply, setAutoApply] = useState(false);
+  const [mode, setMode] = useState<"predictive" | "threshold">("predictive");
+  const [selectedModel, setSelectedModel] = useState<ModelName>("xgboost");
   const [series, setSeries] = useState<Point[]>([]);
+  const [events, setEvents] = useState<EventItem[]>([]);
+  const [windowSize, setWindowSize] = useState(80);
+  const [metricsOnline, setMetricsOnline] = useState(false);
+  const [metricSource, setMetricSource] = useState("waiting");
+  const [lastPrediction, setLastPrediction] = useState<PredictionResponse>({
+    recommended: null,
+  });
 
-  // Refs to avoid stale closures
-  const modeRef = useRef(mode);
+  const instancesRef = useRef({ threshold: 1, predictive: 1 });
+  const historyRef = useRef<MetricSample[]>([]);
   const runningRef = useRef(running);
-  const spikeChanceRef = useRef(spikeChance);
+  const autoApplyRef = useRef(autoApply);
+  const modeRef = useRef(mode);
+  const selectedModelRef = useRef(selectedModel);
   const windowSizeRef = useRef(windowSize);
-  const spikeStateRef = useRef(spikeState);
-  const seriesRef = useRef<Point[]>(series);
+  const lastScaleAtRef = useRef(0);
+  const lastThresholdScaleAtRef = useRef(0);
+  const lastObservedReplicasRef = useRef<number | null>(null);
+  const lastAiRecommendationRef = useRef<number | null>(null);
+  const lastEventKeyRef = useRef("");
+
+  useEffect(() => {
+    runningRef.current = running;
+  }, [running]);
+
+  useEffect(() => {
+    autoApplyRef.current = autoApply;
+  }, [autoApply]);
 
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
+
   useEffect(() => {
-    runningRef.current = running;
-  }, [running]);
-  useEffect(() => {
-    spikeChanceRef.current = spikeChance;
-  }, [spikeChance]);
+    selectedModelRef.current = selectedModel;
+  }, [selectedModel]);
+
   useEffect(() => {
     windowSizeRef.current = windowSize;
   }, [windowSize]);
-  useEffect(() => {
-    spikeStateRef.current = spikeState;
-  }, [spikeState]);
-  useEffect(() => {
-    seriesRef.current = series;
-  }, [series]);
 
   const logEvent = (kind: EventItem["kind"], msg: string) => {
-    const ts = formatTime(new Date());
-    setEvents((prev) => [{ ts, kind, msg }, ...prev].slice(0, 8));
+    setEvents((prev) =>
+      [{ ts: formatTime(new Date()), kind, msg }, ...prev].slice(0, 10),
+    );
   };
 
-  // Mount + seed on client only
+  const logEventOnce = (kind: EventItem["kind"], msg: string) => {
+    const key = `${kind}:${msg}`;
+    if (lastEventKeyRef.current === key) return;
+    lastEventKeyRef.current = key;
+    logEvent(kind, msg);
+  };
+
+  const resetDashboard = () => {
+    setSeries([]);
+    setEvents([]);
+    setLastPrediction({ recommended: null });
+    historyRef.current = [];
+    instancesRef.current = { threshold: 1, predictive: 1 };
+    lastScaleAtRef.current = 0;
+    lastThresholdScaleAtRef.current = 0;
+    lastObservedReplicasRef.current = null;
+    lastAiRecommendationRef.current = null;
+    lastEventKeyRef.current = "";
+  };
+
   useEffect(() => {
     setMounted(true);
-
-    const now = new Date();
-    const seed: Point[] = [];
-    for (let i = 30; i > 0; i--) {
-      const t = new Date(now.getTime() - i * 1000);
-      seed.push({
-        t: formatTime(t),
-        tsMs: t.getTime(),
-        rps: 45,
-
-        // active defaults
-        p95: 180,
-        cost: 0.12,
-        instances: 2,
-        cpu: 30,
-        errors: 0.2,
-
-        // parallel
-        inst_threshold: 2,
-        inst_predictive: 2,
-
-        cpu_threshold: 30,
-        cpu_predictive: 30,
-
-        p95_threshold: 180,
-        p95_predictive: 180,
-
-        errors_threshold: 0.2,
-        errors_predictive: 0.2,
-
-        cost_threshold: 0.12,
-        cost_predictive: 0.12,
-      });
-    }
-    setSeries(seed);
   }, []);
 
-  // Main scheduler: random 5–10s updates
   useEffect(() => {
     if (!mounted) return;
 
     let timeoutId: ReturnType<typeof setTimeout> | null = null;
 
-    const scheduleNext = () => {
-      const ms = randInt(5000, 10000);
+    const tick = async () => {
+      if (!runningRef.current) {
+        timeoutId = setTimeout(tick, 1200);
+        return;
+      }
 
-      timeoutId = setTimeout(() => {
-        if (!runningRef.current) {
-          scheduleNext();
-          return;
-        }
+      const metric = await fetchCloudWatchMetrics();
 
-        const nowMs = Date.now();
-
-        // Spike handling
-        const st = spikeStateRef.current;
-
-        // Maybe start a spike
-        if (!st.active && Math.random() * 100 < spikeChanceRef.current) {
-          const durationMs = pick([15000, 20000, 25000] as const);
-          const mult = randFloat(3.5, 7.5);
-
-          const nextSpike: SpikeState = {
-            active: true,
-            endsAt: nowMs + durationMs,
-            mult,
-          };
-          spikeStateRef.current = nextSpike;
-          setSpikeState(nextSpike);
-
-          logEvent(
-            "spike",
-            `Traffic spike started (×${mult.toFixed(1)}) for ~${Math.round(durationMs / 1000)}s`,
-          );
-        }
-
-        // Determine spike multiplier + end spike if needed
-        let spikeMult = 1;
-        const st2 = spikeStateRef.current;
-
-        if (st2.active) {
-          if (nowMs >= st2.endsAt) {
-            const cleared: SpikeState = { active: false, endsAt: 0, mult: 1 };
-            spikeStateRef.current = cleared;
-            setSpikeState(cleared);
-            logEvent("note", "Traffic spike ended; returning to baseline");
-          } else {
-            spikeMult = st2.mult;
-          }
-        }
-
-        // Workload drift
-        baseRef.current.rps = clamp(
-          baseRef.current.rps + randFloat(-6, 6),
-          25,
-          120,
+      if (!metric) {
+        setMetricsOnline(false);
+        logEventOnce(
+          "note",
+          "Waiting for CloudWatch metrics from /api/cloudwatch",
         );
-        const rps = Math.round(baseRef.current.rps * spikeMult);
+        timeoutId = setTimeout(tick, 3000);
+        return;
+      }
 
-        const last = seriesRef.current[seriesRef.current.length - 1];
-        const recentDelta = last ? rps - last.rps : 0;
-        const predictedHigh = spikeMult > 1 || recentDelta > 60;
+      setMetricsOnline(true);
+      setMetricSource(metric.source ?? "CloudWatch / EKS");
 
-        // Scaling thresholds
-        const thresholdUp = 70;
-        const thresholdDown = 35;
+      const MAX_REPLICAS = 5;
+      const now = new Date(metric.timestamp).getTime() || Date.now();
+      const currentReplicas = clamp(metric.replicas || 1, 1, MAX_REPLICAS);
 
-        // --- Parallel simulate THRESHOLD (traditional) ---
-        let instT = simRef.current.inst_threshold;
+      if (
+        lastObservedReplicasRef.current !== null &&
+        currentReplicas !== lastObservedReplicasRef.current
+      ) {
+        const direction =
+          currentReplicas > lastObservedReplicasRef.current ? "up" : "down";
 
-        const mT1 = simulateMetrics(rps, instT);
-        let desiredT = instT;
+        logEventOnce(
+          "cloudwatch",
+          `CloudWatch observed scale ${direction}: ${lastObservedReplicasRef.current} → ${currentReplicas} pods`,
+        );
+      }
 
-        if (mT1.cpu > thresholdUp && instT < 12) {
-          desiredT = clamp(instT + 1, 1, 12);
-        } else if (mT1.cpu < thresholdDown && spikeMult === 1 && instT > 2) {
-          desiredT = clamp(instT - 1, 1, 12);
+      lastObservedReplicasRef.current = currentReplicas;
+
+      let instT = instancesRef.current.threshold;
+      let instP = instancesRef.current.predictive;
+
+      // Only initialize from CloudWatch once. Do not overwrite the dashboard's
+      // predicted pod state every tick, otherwise repeated recommendations look like
+      // 1 → 3, 1 → 3, 1 → 3 even after the chart already moved to 3.
+      if (instP < 1) {
+        instP = currentReplicas;
+      }
+
+      const thresholdProbe = projectHealth(metric, instT);
+      let desiredT = instT;
+
+      const nowMs = Date.now();
+      const thresholdCooldownMs = 20_000;
+
+      const thresholdHigh =
+        metric.cpu_percent > 65 ||
+        metric.response_time_ms > 450 ||
+        metric.requests > 120;
+
+      const thresholdLow =
+        metric.cpu_percent < 35 &&
+        metric.response_time_ms < 280 &&
+        metric.requests < 60;
+
+      if (nowMs - lastThresholdScaleAtRef.current > thresholdCooldownMs) {
+        if (thresholdHigh && instT < MAX_REPLICAS) {
+          desiredT = clamp(instT + 1, 1, MAX_REPLICAS);
+          lastThresholdScaleAtRef.current = nowMs;
+        } else if (thresholdLow && instT > 1) {
+          desiredT = clamp(instT - 1, 1, MAX_REPLICAS);
+          lastThresholdScaleAtRef.current = nowMs;
         }
+      }
 
-        if (desiredT !== instT) {
+      if (desiredT !== instT) {
+        const direction = desiredT > instT ? "scale up" : "scale down";
+        logEvent(
+          "threshold",
+          `Threshold baseline would ${direction}: ${instT} → ${desiredT} pods`,
+        );
+        instT = desiredT;
+      }
+
+      const sample: MetricSample = {
+        requests: metric.requests,
+        response_time_ms: metric.response_time_ms,
+        node_cpu_millicores: metric.node_cpu_millicores,
+        pod_cpu_millicores: metric.pod_cpu_millicores,
+        pod_mem_mi: metric.pod_mem_mi,
+        replicas: instP,
+      };
+
+      historyRef.current = [...historyRef.current, sample].slice(-30);
+
+      const recent = historyRef.current.slice(-6);
+      const avgRecentRps = recent.length
+        ? recent.reduce((sum, item) => sum + item.requests, 0) / recent.length
+        : metric.requests;
+
+      const trafficIsRising =
+        recent.length >= 2 &&
+        recent[recent.length - 1]!.requests > recent[0]!.requests * 1.2;
+
+      let desiredP = instP;
+
+      if (historyRef.current.length >= 13) {
+        const prediction = await callPredictAPI(
+          historyRef.current,
+          selectedModelRef.current,
+        );
+
+        setLastPrediction(prediction);
+
+        if (prediction.recommended !== null) {
+          desiredP = clamp(prediction.recommended, 1, MAX_REPLICAS);
+        }
+      }
+
+      // SLA-aware guardrail: the model can be cost-conscious, but we prevent under-scaling.
+      let safetyFloor = 1;
+
+      if (avgRecentRps > 80 || metric.cpu_percent > 55 || trafficIsRising) {
+        safetyFloor = 2;
+      }
+      if (
+        avgRecentRps > 140 ||
+        metric.cpu_percent > 70 ||
+        metric.response_time_ms > 500
+      ) {
+        safetyFloor = 3;
+      }
+      if (
+        avgRecentRps > 220 ||
+        metric.cpu_percent > 82 ||
+        metric.response_time_ms > 800
+      ) {
+        safetyFloor = 4;
+      }
+      if (
+        avgRecentRps > 420 ||
+        metric.cpu_percent > 94 ||
+        metric.response_time_ms > 1300
+      ) {
+        safetyFloor = 5;
+      }
+
+      desiredP = Math.max(desiredP, safetyFloor);
+
+      const recentLowLoad = historyRef.current
+        .slice(-4)
+        .every((item) => item.requests < 60);
+
+      if (
+        recentLowLoad &&
+        metric.cpu_percent < 40 &&
+        metric.response_time_ms < 350 &&
+        instP > 1
+      ) {
+        desiredP = clamp(instP - 1, 1, MAX_REPLICAS);
+      }
+
+      if (desiredP !== instP) {
+        const direction = desiredP > instP ? "scale up" : "scale down";
+
+        // Avoid repeating the same recommendation every poll.
+        if (lastAiRecommendationRef.current !== desiredP) {
           logEvent(
-            "scale",
-            `Threshold scaling: ${instT} → ${desiredT} instances`,
+            "ai",
+            `AI recommends ${direction}: ${instP} → ${desiredP} pods`,
           );
-          instT = desiredT;
+          lastAiRecommendationRef.current = desiredP;
         }
+      } else {
+        lastAiRecommendationRef.current = instP;
+      }
 
-        const mT2 = simulateMetrics(rps, instT);
-        const costT = estimateCost(instT, spikeMult);
+      if (autoApplyRef.current && desiredP !== instP) {
+        const cooldownMs = 90_000;
 
-        // --- Parallel simulate PREDICTIVE (AI) ---
-        let instP = simRef.current.inst_predictive;
+        if (nowMs - lastScaleAtRef.current > cooldownMs) {
+          const result = await applyScale(desiredP);
 
-        const mP1 = simulateMetrics(rps, instP);
-        let desiredP = instP;
-
-        if (predictedHigh && instP < 10) {
-          desiredP = clamp(instP + 2, 1, 12); // proactive jump
-        } else if (mP1.cpu > thresholdUp && instP < 12) {
-          desiredP = clamp(instP + 1, 1, 12);
-        } else if (mP1.cpu < thresholdDown && spikeMult === 1 && instP > 2) {
-          desiredP = clamp(instP - 1, 1, 12);
+          if (result?.ok) {
+            lastScaleAtRef.current = nowMs;
+            logEvent(
+              "scale",
+              `Applied AI scaling to EKS: replicas = ${desiredP}`,
+            );
+          } else {
+            logEvent(
+              "note",
+              "AI scaling was recommended, but /api/scale did not apply it",
+            );
+          }
+        } else {
+          logEventOnce("note", "Scale skipped because cooldown is active");
         }
+      }
 
-        if (desiredP !== instP) {
-          logEvent(
-            "scale",
-            `Predictive scaling: ${instP} → ${desiredP} instances`,
-          );
-          instP = desiredP;
-        }
+      instP = desiredP;
 
-        const mP2 = simulateMetrics(rps, instP);
-        const costP = estimateCost(instP, spikeMult);
+      const thresholdMetrics = projectHealth(metric, instT);
+      const predictiveMetrics = projectHealth(metric, instP);
+      const costT = estimateCost(instT);
+      const costP = estimateCost(instP);
 
-        // Commit parallel instance state
-        simRef.current.inst_threshold = instT;
-        simRef.current.inst_predictive = instP;
+      instancesRef.current = { threshold: instT, predictive: instP };
 
-        // Choose active mode (what KPI cards show)
-        const activeMode = modeRef.current;
-        const active =
-          activeMode === "predictive"
-            ? {
-                inst: instP,
-                cpu: mP2.cpu,
-                p95: mP2.p95,
-                errors: mP2.errors,
-                cost: costP,
-              }
-            : {
-                inst: instT,
-                cpu: mT2.cpu,
-                p95: mT2.p95,
-                errors: mT2.errors,
-                cost: costT,
-              };
+      const active =
+        modeRef.current === "predictive"
+          ? {
+              instances: instP,
+              cpu: predictiveMetrics.cpu,
+              p95: predictiveMetrics.p95,
+              errors: predictiveMetrics.errors,
+              cost: costP,
+            }
+          : {
+              instances: instT,
+              cpu: thresholdMetrics.cpu,
+              p95: thresholdMetrics.p95,
+              errors: thresholdMetrics.errors,
+              cost: costT,
+            };
 
-        const point: Point = {
-          t: formatTime(new Date(nowMs)),
-          tsMs: nowMs,
-          rps,
+      const point: Point = {
+        t: formatTime(new Date(now)),
+        tsMs: now,
+        rps: metric.requests,
+        inst_threshold: instT,
+        inst_predictive: instP,
+        cpu_threshold: thresholdMetrics.cpu,
+        cpu_predictive: predictiveMetrics.cpu,
+        p95_threshold: thresholdMetrics.p95,
+        p95_predictive: predictiveMetrics.p95,
+        errors_threshold: thresholdMetrics.errors,
+        errors_predictive: predictiveMetrics.errors,
+        cost_threshold: costT,
+        cost_predictive: costP,
+        active_cpu: active.cpu,
+        active_p95: active.p95,
+        active_errors: active.errors,
+        active_instances: active.instances,
+        active_cost: active.cost,
+        memory_percent: metric.memory_percent,
+      };
 
-          instances: active.inst,
-          cpu: Math.round(active.cpu),
-          p95: active.p95,
-          errors: Number(active.errors.toFixed(2)),
-          cost: Number(active.cost.toFixed(2)),
+      setSeries((prev) => [...prev, point].slice(-windowSizeRef.current));
 
-          inst_threshold: instT,
-          inst_predictive: instP,
-
-          cpu_threshold: Math.round(mT2.cpu),
-          cpu_predictive: Math.round(mP2.cpu),
-
-          p95_threshold: mT2.p95,
-          p95_predictive: mP2.p95,
-
-          errors_threshold: Number(mT2.errors.toFixed(2)),
-          errors_predictive: Number(mP2.errors.toFixed(2)),
-
-          cost_threshold: Number(costT.toFixed(2)),
-          cost_predictive: Number(costP.toFixed(2)),
-        };
-
-        setSeries((prev) => {
-          const next = [...prev, point];
-          const sliced = next.slice(
-            Math.max(0, next.length - windowSizeRef.current),
-          );
-          seriesRef.current = sliced;
-          return sliced;
-        });
-
-        scheduleNext();
-      }, ms);
+      timeoutId = setTimeout(tick, 5000);
     };
 
-    scheduleNext();
+    timeoutId = setTimeout(tick, 500);
 
     return () => {
       if (timeoutId) clearTimeout(timeoutId);
     };
   }, [mounted]);
 
-  const kpis = useMemo(() => series[series.length - 1], [series]);
+  const latest = series[series.length - 1];
 
-  const status = useMemo(() => {
-    if (!running) return { label: "Paused", kind: "warn" as const };
-    if (spikeState.active)
-      return { label: "Spike Active", kind: "danger" as const };
-    return { label: "Normal", kind: "default" as const };
-  }, [running, spikeState.active]);
-
-  // Rolling comparison for display (short window ~ up to 60 points)
   const comparison = useMemo(() => {
-    if (!series.length) return null;
+    if (series.length < 2) return null;
 
-    const slice = series.slice(
-      Math.max(0, series.length - Math.min(windowSize, 60)),
-    );
+    const slice = series.slice(-Math.min(series.length, 50));
+    const avg = (arr: number[]) => arr.reduce((a, b) => a + b, 0) / arr.length;
 
-    const avg = (arr: number[]) =>
-      arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+    const avgP95Threshold = avg(slice.map((p) => p.p95_threshold));
+    const avgP95Predictive = avg(slice.map((p) => p.p95_predictive));
+    const avgErrThreshold = avg(slice.map((p) => p.errors_threshold));
+    const avgErrPredictive = avg(slice.map((p) => p.errors_predictive));
+    const avgCostThreshold = avg(slice.map((p) => p.cost_threshold));
+    const avgCostPredictive = avg(slice.map((p) => p.cost_predictive));
 
-    const p95T = avg(slice.map((p) => p.p95_threshold));
-    const p95P = avg(slice.map((p) => p.p95_predictive));
-
-    const errT = avg(slice.map((p) => p.errors_threshold));
-    const errP = avg(slice.map((p) => p.errors_predictive));
-
-    const costT = avg(slice.map((p) => p.cost_threshold));
-    const costP = avg(slice.map((p) => p.cost_predictive));
-
-    const slaRiskT = slice.filter(
+    const slaRiskThreshold = slice.filter(
       (p) => p.p95_threshold > 800 || p.errors_threshold > 1,
     ).length;
-    const slaRiskP = slice.filter(
+
+    const slaRiskPredictive = slice.filter(
       (p) => p.p95_predictive > 800 || p.errors_predictive > 1,
     ).length;
 
-    const benefitLatency = p95T > 0 ? ((p95T - p95P) / p95T) * 100 : 0;
-    const benefitErrors = errT > 0 ? ((errT - errP) / errT) * 100 : 0;
-    const costDelta = costP - costT;
+    const latencyImprovement =
+      avgP95Threshold > 0
+        ? ((avgP95Threshold - avgP95Predictive) / avgP95Threshold) * 100
+        : 0;
+
+    const errorImprovement =
+      avgErrThreshold > 0
+        ? ((avgErrThreshold - avgErrPredictive) / avgErrThreshold) * 100
+        : 0;
+
+    const costDelta = avgCostPredictive - avgCostThreshold;
+    const costSavings =
+      avgCostThreshold > 0
+        ? ((avgCostThreshold - avgCostPredictive) / avgCostThreshold) * 100
+        : 0;
+
+    const slaRiskReduction = slaRiskThreshold - slaRiskPredictive;
+
+    const score =
+      costSavings * 0.45 +
+      latencyImprovement * 0.3 +
+      errorImprovement * 0.15 +
+      slaRiskReduction * 2;
+
+    const summary =
+      latencyImprovement >= 0 && errorImprovement >= 0
+        ? "AI is improving performance while controlling cost."
+        : costSavings > 0
+          ? "AI is saving cost, but the model is more conservative on SLA."
+          : "Threshold is currently performing better; tune AI guardrails or retrain.";
 
     return {
-      p95T,
-      p95P,
-      errT,
-      errP,
-      costT,
-      costP,
-      slaRiskT,
-      slaRiskP,
-      benefitLatency,
-      benefitErrors,
+      avgP95Threshold,
+      avgP95Predictive,
+      avgErrThreshold,
+      avgErrPredictive,
+      avgCostThreshold,
+      avgCostPredictive,
+      latencyImprovement,
+      errorImprovement,
       costDelta,
-    };
-  }, [series, windowSize]);
-
-  // ✅ Total benefit over last 1 hour (based on tsMs)
-  const lastHourBenefit = useMemo(() => {
-    if (!series.length) return null;
-
-    const now = Date.now();
-    const oneHourAgo = now - 60 * 60 * 1000;
-
-    const slice = series.filter((p) => p.tsMs >= oneHourAgo);
-
-    if (slice.length < 2) {
-      return {
-        points: 0,
-        hours: 0,
-        slaSaved: 0,
-        avgLatPct: 0,
-        avgErrPct: 0,
-        spendDelta: 0,
-      };
-    }
-
-    const minTs = slice[0]!.tsMs;
-    const maxTs = slice[slice.length - 1]!.tsMs;
-    const hours = Math.max(0.001, (maxTs - minTs) / 3600000);
-
-    const avg = (arr: number[]) =>
-      arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
-
-    const p95T = avg(slice.map((p) => p.p95_threshold));
-    const p95P = avg(slice.map((p) => p.p95_predictive));
-
-    const errT = avg(slice.map((p) => p.errors_threshold));
-    const errP = avg(slice.map((p) => p.errors_predictive));
-
-    const avgCostT = avg(slice.map((p) => p.cost_threshold));
-    const avgCostP = avg(slice.map((p) => p.cost_predictive));
-
-    const slaRiskT = slice.filter(
-      (p) => p.p95_threshold > 800 || p.errors_threshold > 1,
-    ).length;
-    const slaRiskP = slice.filter(
-      (p) => p.p95_predictive > 800 || p.errors_predictive > 1,
-    ).length;
-
-    const avgLatPct = p95T > 0 ? ((p95T - p95P) / p95T) * 100 : 0;
-    const avgErrPct = errT > 0 ? ((errT - errP) / errT) * 100 : 0;
-
-    // Estimated spend delta over that covered time window:
-    // (avg $/hr predictive - avg $/hr threshold) * hours
-    const spendDelta = (avgCostP - avgCostT) * hours;
-
-    return {
-      points: slice.length,
-      hours,
-      slaSaved: Math.max(0, slaRiskT - slaRiskP),
-      avgLatPct,
-      avgErrPct,
-      spendDelta,
+      costSavings,
+      slaRiskReduction,
+      slaRiskThreshold,
+      slaRiskPredictive,
+      score,
+      summary,
     };
   }, [series]);
 
+  const status = useMemo(() => {
+    if (!running) return { label: "Paused", variant: "warn" as const };
+    if (!metricsOnline) {
+      return { label: "Waiting for CloudWatch", variant: "warn" as const };
+    }
+    if ((latest?.active_p95 ?? 0) > 800 || (latest?.active_errors ?? 0) > 1) {
+      return { label: "SLA risk", variant: "danger" as const };
+    }
+
+    return { label: "CloudWatch live", variant: "ok" as const };
+  }, [running, metricsOnline, latest]);
+
   if (!mounted) {
     return (
-      <div
-        className="min-h-screen w-full bg-gray-50 p-6"
-        suppressHydrationWarning
-      >
-        <div className="mx-auto max-w-6xl">
-          <h1 className="text-2xl font-semibold">
-            Predictive Auto-Scaling Dashboard (Mock)
-          </h1>
-          <p className="mt-2 text-sm text-gray-600">Loading dashboard…</p>
+      <main className="min-h-screen bg-slate-50 p-6">
+        <div className="mx-auto max-w-7xl">
+          <h1 className="text-2xl font-semibold">Loading dashboard…</h1>
         </div>
-      </div>
+      </main>
     );
   }
 
   return (
-    <div
-      className="min-h-screen w-full bg-gray-50 p-4 md:p-8"
-      suppressHydrationWarning
-    >
-      <div className="mx-auto max-w-6xl space-y-6">
-        {/* Header */}
-        <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
-          <div>
-            <h1 className="text-2xl font-semibold tracking-tight md:text-3xl">
-              Predictive Auto-Scaling Dashboard (Mock)
-            </h1>
-            <p className="mt-1 text-sm text-gray-600">
-              Simulated workload and autoscaling behavior for evaluation and
-              demo.
-            </p>
-          </div>
+    <main className="min-h-screen bg-slate-50 p-4 text-slate-950 md:p-8">
+      <div className="mx-auto max-w-7xl space-y-5">
+        <section className="rounded-3xl border bg-white p-5 shadow-sm md:p-6">
+          <div className="flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between">
+            <div>
+              <div className="mb-2 inline-flex items-center gap-2 rounded-full border bg-slate-50 px-3 py-1 text-xs font-medium text-slate-600">
+                <Brain className="h-3.5 w-3.5" /> EKS AI pod autoscaling demo
+              </div>
 
-          <div className="flex flex-col gap-3 md:flex-row md:items-center">
-            <span
-              className={`inline-flex items-center rounded-full border px-3 py-1 text-xs font-medium ${pillClass(
-                status.kind,
-              )}`}
-            >
-              {status.label}
-            </span>
+              <h1 className="text-2xl font-semibold tracking-tight md:text-4xl">
+                Predictive Auto-Scaling Dashboard
+              </h1>
 
-            <div className="flex items-center gap-2">
-              <span className="text-sm text-gray-600">Threshold</span>
-              <label className="relative inline-flex cursor-pointer items-center">
-                <input
-                  type="checkbox"
-                  className="peer sr-only"
-                  checked={mode === "predictive"}
-                  onChange={(e) =>
-                    setMode(e.target.checked ? "predictive" : "threshold")
-                  }
-                  aria-label="Toggle predictive mode"
-                />
-                <div className="peer h-6 w-11 rounded-full bg-gray-300 peer-checked:bg-emerald-500 after:absolute after:top-0.5 after:left-0.5 after:h-5 after:w-5 after:rounded-full after:bg-white after:transition-all peer-checked:after:translate-x-full" />
-              </label>
-              <span className="text-sm text-gray-600">Predictive</span>
+              <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">
+                Live CloudWatch/EKS metrics are sent to the AI model. The
+                dashboard compares a threshold baseline against an SLA-aware AI
+                policy and can apply the AI replica decision to a Kubernetes
+                Deployment.
+              </p>
             </div>
 
+            <div className="grid gap-3 sm:grid-cols-2 lg:min-w-130">
+              <div className="rounded-2xl border bg-slate-50 p-3">
+                <label className="text-xs font-medium text-slate-500">
+                  Model
+                </label>
+                <select
+                  value={selectedModel}
+                  onChange={(e) =>
+                    setSelectedModel(e.target.value as ModelName)
+                  }
+                  className="mt-1 w-full rounded-xl border bg-white px-3 py-2 text-sm font-medium outline-none"
+                >
+                  <option value="xgboost">XGBoost</option>
+                  <option value="random_forest">Random Forest</option>
+                </select>
+              </div>
+
+              <div className="rounded-2xl border bg-slate-50 p-3">
+                <label className="text-xs font-medium text-slate-500">
+                  Active strategy
+                </label>
+
+                <div className="mt-1 grid grid-cols-2 gap-2">
+                  <button
+                    onClick={() => setMode("predictive")}
+                    className={`rounded-xl px-3 py-2 text-sm font-medium transition ${
+                      mode === "predictive"
+                        ? "bg-slate-950 text-white"
+                        : "border bg-white text-slate-700 hover:bg-slate-100"
+                    }`}
+                  >
+                    AI
+                  </button>
+
+                  <button
+                    onClick={() => setMode("threshold")}
+                    className={`rounded-xl px-3 py-2 text-sm font-medium transition ${
+                      mode === "threshold"
+                        ? "bg-slate-950 text-white"
+                        : "border bg-white text-slate-700 hover:bg-slate-100"
+                    }`}
+                  >
+                    Threshold
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-5 flex flex-wrap items-center gap-3">
+            <StatusPill variant={status.variant}>{status.label}</StatusPill>
+
             <button
-              className={`rounded-lg border px-4 py-2 text-sm font-medium ${
-                running
-                  ? "bg-white hover:bg-gray-100"
-                  : "border-emerald-600 bg-emerald-600 text-white hover:bg-emerald-700"
-              }`}
-              onClick={() => setRunning((r) => !r)}
+              onClick={() => setRunning((v) => !v)}
+              className="inline-flex items-center gap-2 rounded-xl border bg-white px-3 py-2 text-sm font-medium hover:bg-slate-50"
             >
+              {running ? (
+                <Pause className="h-4 w-4" />
+              ) : (
+                <Play className="h-4 w-4" />
+              )}
               {running ? "Pause" : "Resume"}
             </button>
-          </div>
-        </div>
 
-        {/* KPI cards (active mode) */}
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
+            <button
+              onClick={resetDashboard}
+              className="inline-flex items-center gap-2 rounded-xl border bg-white px-3 py-2 text-sm font-medium hover:bg-slate-50"
+            >
+              <RotateCcw className="h-4 w-4" /> Reset
+            </button>
+
+            <label className="inline-flex items-center gap-2 rounded-xl border bg-white px-3 py-2 text-sm font-medium">
+              <input
+                type="checkbox"
+                checked={autoApply}
+                onChange={(e) => setAutoApply(e.target.checked)}
+              />
+              Apply AI scaling to EKS
+            </label>
+
+            <div className="ml-auto text-xs text-slate-500">
+              Source:{" "}
+              <span className="font-medium text-slate-700">{metricSource}</span>
+            </div>
+          </div>
+        </section>
+
+        <section className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-6">
           <KpiCard
             icon={<Activity className="h-4 w-4" />}
-            label="Traffic (RPS)"
-            value={`${kpis?.rps ?? "–"}`}
-            hint={spikeState.active ? "spike" : "steady"}
+            label="Requests"
+            value={`${latest?.rps ?? "–"}`}
+            hint="CloudWatch samples"
           />
           <KpiCard
             icon={<Gauge className="h-4 w-4" />}
-            label="p95 Latency"
-            value={`${kpis?.p95 ?? "–"} ms`}
-            hint={(kpis?.p95 ?? 0) > 800 ? "degraded" : "ok"}
+            label="CPU"
+            value={`${latest?.active_cpu ?? "–"}%`}
+            hint="active strategy"
+          />
+          <KpiCard
+            icon={<Server className="h-4 w-4" />}
+            label="Memory"
+            value={`${latest?.memory_percent ?? "–"}%`}
+            hint="pod memory"
           />
           <KpiCard
             icon={<Layers className="h-4 w-4" />}
-            label="Instances"
-            value={`${kpis?.instances ?? "–"}`}
-            hint={mode}
+            label="AI pods"
+            value={`${latest?.inst_predictive ?? "–"}`}
+            hint={`raw: ${lastPrediction.raw ? lastPrediction.raw.toFixed(2) : "waiting"}`}
+          />
+          <KpiCard
+            icon={<ShieldCheck className="h-4 w-4" />}
+            label="Threshold pods"
+            value={`${latest?.inst_threshold ?? "–"}`}
+            hint="baseline"
           />
           <KpiCard
             icon={<Zap className="h-4 w-4" />}
-            label="Est. Cost"
-            value={`$${(kpis?.cost ?? 0).toFixed(2)}/hr`}
-            hint="approx"
+            label="Active p95"
+            value={`${latest?.active_p95 ?? "–"} ms`}
+            hint={latest && latest.active_p95 > 800 ? "SLA risk" : "healthy"}
           />
-        </div>
+        </section>
 
-        {/* ✅ Total benefit in last 1 hour */}
-        <div className="rounded-2xl border bg-white p-4 shadow-sm md:p-6">
-          <div className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
-            <div>
-              <h2 className="text-base font-semibold">
-                Total Benefit (Last 1 Hour)
-              </h2>
-              <p className="mt-1 text-sm text-gray-600">
-                Summary of predictive vs threshold outcomes over the last hour
-                of collected points.
-              </p>
-            </div>
-            <div className="text-xs text-gray-600">
-              Based on real timestamps (tsMs).
-            </div>
-          </div>
-
-          {!lastHourBenefit || lastHourBenefit.points < 2 ? (
-            <p className="mt-4 text-sm text-gray-600">
-              Not enough data yet for a full hour. Keep the dashboard running.
-            </p>
-          ) : (
-            <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-4">
-              <KpiCard
-                icon={<Layers className="h-4 w-4" />}
-                label="SLA risks avoided"
-                value={`${lastHourBenefit.slaSaved}`}
-                hint="(p95>800ms or errors>1%)"
-              />
-              <KpiCard
-                icon={<Gauge className="h-4 w-4" />}
-                label="Avg latency change"
-                value={formatSignedPct(lastHourBenefit.avgLatPct)}
-                hint="Predictive vs threshold"
-              />
-              <KpiCard
-                icon={<Activity className="h-4 w-4" />}
-                label="Avg errors change"
-                value={formatSignedPct(lastHourBenefit.avgErrPct)}
-                hint="Predictive vs threshold"
-              />
-              <KpiCard
-                icon={<Zap className="h-4 w-4" />}
-                label="Spend difference"
-                value={formatSignedUsd(lastHourBenefit.spendDelta)}
-                hint="($ over covered window)"
-              />
-            </div>
-          )}
-
-          <p className="mt-4 text-xs text-gray-600">
-            Interpretation: Positive latency/errors change means predictive is
-            better (lower). Spend difference may be positive because predictive
-            can scale earlier.
-          </p>
-        </div>
-
-        {/* Comparison panel (rolling) */}
-        <div className="rounded-2xl border bg-white p-4 shadow-sm md:p-6">
-          <div className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
-            <div>
-              <h2 className="text-base font-semibold">
-                Traditional vs Predictive (Live Comparison)
-              </h2>
-              <p className="mt-1 text-sm text-gray-600">
-                Both strategies are simulated on the same traffic. Predictive
-                tries to scale earlier when a spike is likely.
-              </p>
-            </div>
-            {comparison ? (
-              <div className="text-xs text-gray-600">
-                Window: last ~{Math.min(windowSize, 60)} points
-              </div>
-            ) : null}
-          </div>
-
-          {!comparison ? (
-            <p className="mt-4 text-sm text-gray-600">Collecting data…</p>
-          ) : (
-            <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-3">
-              <div className="rounded-2xl border p-4">
-                <div className="text-xs font-medium text-gray-600">
-                  Traditional (Threshold)
-                </div>
-                <div className="mt-3 space-y-2 text-sm">
-                  <Row
-                    label="Avg p95"
-                    value={`${Math.round(comparison.p95T)} ms`}
-                  />
-                  <Row
-                    label="Avg errors"
-                    value={`${comparison.errT.toFixed(2)}%`}
-                  />
-                  <Row
-                    label="SLA risk count"
-                    value={`${comparison.slaRiskT}`}
-                  />
-                  <Row
-                    label="Avg cost"
-                    value={`$${comparison.costT.toFixed(2)}/hr`}
-                  />
-                </div>
-              </div>
-
-              <div className="rounded-2xl border p-4">
-                <div className="text-xs font-medium text-gray-600">
-                  Predictive (AI)
-                </div>
-                <div className="mt-3 space-y-2 text-sm">
-                  <Row
-                    label="Avg p95"
-                    value={`${Math.round(comparison.p95P)} ms`}
-                  />
-                  <Row
-                    label="Avg errors"
-                    value={`${comparison.errP.toFixed(2)}%`}
-                  />
-                  <Row
-                    label="SLA risk count"
-                    value={`${comparison.slaRiskP}`}
-                  />
-                  <Row
-                    label="Avg cost"
-                    value={`$${comparison.costP.toFixed(2)}/hr`}
-                  />
-                </div>
-              </div>
-
-              <div className="rounded-2xl border p-4">
-                <div className="text-xs font-medium text-gray-600">
-                  Benefit Summary
-                </div>
-                <div className="mt-3 space-y-2 text-sm">
-                  <Row
-                    label="Latency improvement"
-                    value={formatSignedPct(comparison.benefitLatency)}
-                  />
-                  <Row
-                    label="Errors improvement"
-                    value={formatSignedPct(comparison.benefitErrors)}
-                  />
-                  <Row
-                    label="SLA risk reduction"
-                    value={`${Math.max(0, comparison.slaRiskT - comparison.slaRiskP)}`}
-                  />
-                  <Row
-                    label="Cost tradeoff"
-                    value={formatSignedUsd(comparison.costDelta)}
-                  />
-                </div>
-                <p className="mt-3 text-xs text-gray-600">
-                  Predictive usually reduces p95/errors during spikes by scaling
-                  earlier, but may cost slightly more when it over-prepares.
+        <section className="grid grid-cols-1 gap-5 xl:grid-cols-3">
+          <div className="rounded-3xl border bg-white p-5 shadow-sm xl:col-span-2">
+            <div className="mb-4 flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
+              <div>
+                <h2 className="text-lg font-semibold">
+                  CloudWatch traffic and pod scaling
+                </h2>
+                <p className="mt-1 text-sm text-slate-600">
+                  Gray area shows request pressure. Solid blue shows AI pods.
+                  Dashed orange shows threshold pods.
                 </p>
               </div>
-            </div>
-          )}
-        </div>
 
-        {/* Charts */}
-        <div className="rounded-2xl border bg-white p-4 shadow-sm md:p-6">
-          <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-            <div>
-              <h2 className="text-base font-semibold">
-                Traffic & Scaling Over Time
-              </h2>
-              <p className="mt-1 text-sm text-gray-600">
-                Top chart: RPS + instance counts for both strategies. Bottom
-                chart: active mode quality metrics.
-              </p>
-            </div>
-
-            <div className="flex flex-col gap-4 md:flex-row md:items-center">
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs text-gray-600">Spike chance</span>
-                  <span className="text-xs font-medium">
-                    {spikeChance}% / tick
-                  </span>
-                </div>
+              <div className="flex items-center gap-3 text-xs text-slate-500">
+                <span>Window</span>
                 <input
                   type="range"
-                  min={5}
-                  max={45}
-                  step={1}
-                  value={spikeChance}
-                  onChange={(e) => setSpikeChance(Number(e.target.value))}
-                  className="w-56"
-                />
-              </div>
-
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs text-gray-600">Window</span>
-                  <span className="text-xs font-medium">
-                    {windowSize} points
-                  </span>
-                </div>
-                <input
-                  type="range"
-                  min={30}
-                  max={180}
+                  min={40}
+                  max={140}
                   step={10}
                   value={windowSize}
                   onChange={(e) => setWindowSize(Number(e.target.value))}
-                  className="w-56"
                 />
+                <span className="w-12 font-medium text-slate-700">
+                  {windowSize}
+                </span>
               </div>
             </div>
-          </div>
 
-          <div className="mt-4 grid grid-cols-1 gap-6 lg:grid-cols-2">
-            {/* RPS + BOTH instance strategies */}
-            <div className="h-72 rounded-xl border p-3">
+            <div className="h-95 rounded-2xl border p-3">
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart
                   data={series}
-                  margin={{ left: 0, right: 12, top: 10, bottom: 0 }}
+                  margin={{ left: 2, right: 24, top: 10, bottom: 2 }}
                 >
                   <CartesianGrid strokeDasharray="3 3" />
-                  <XAxis dataKey="t" tick={{ fontSize: 11 }} minTickGap={24} />
-                  <YAxis tick={{ fontSize: 11 }} />
-                  <Tooltip />
+                  <XAxis dataKey="t" tick={{ fontSize: 11 }} minTickGap={28} />
+
+                  <YAxis
+                    yAxisId="rps"
+                    tick={{ fontSize: 11 }}
+                    label={{
+                      value: "Requests",
+                      angle: -90,
+                      position: "insideLeft",
+                    }}
+                  />
+
+                  <YAxis
+                    yAxisId="instances"
+                    orientation="right"
+                    domain={[0, 5]}
+                    allowDecimals={false}
+                    tick={{ fontSize: 11 }}
+                    label={{
+                      value: "Pods",
+                      angle: 90,
+                      position: "insideRight",
+                    }}
+                  />
+
+                  <Tooltip content={<ChartTooltip />} />
                   <Legend />
+
                   <Area
+                    yAxisId="rps"
                     type="monotone"
                     dataKey="rps"
-                    name="RPS"
-                    fillOpacity={0.15}
+                    name="Requests"
+                    stroke="#94a3b8"
+                    fill="#94a3b8"
+                    fillOpacity={0.18}
                     strokeWidth={2}
+                    isAnimationActive
+                    animationDuration={700}
                   />
+
                   <Line
-                    type="monotone"
-                    dataKey="inst_threshold"
-                    name="Instances (Threshold)"
-                    strokeWidth={2}
-                    dot={false}
-                  />
-                  <Line
-                    type="monotone"
+                    yAxisId="instances"
+                    type="stepAfter"
                     dataKey="inst_predictive"
-                    name="Instances (Predictive)"
-                    strokeWidth={2}
+                    name="AI pods"
+                    stroke="#2563eb"
+                    strokeWidth={3}
                     dot={false}
+                    isAnimationActive
+                    animationDuration={700}
+                  />
+
+                  <Line
+                    yAxisId="instances"
+                    type="stepAfter"
+                    dataKey="inst_threshold"
+                    name="Threshold pods"
+                    stroke="#f97316"
+                    strokeWidth={3}
+                    strokeDasharray="6 4"
+                    dot={false}
+                    isAnimationActive
+                    animationDuration={700}
                   />
                 </AreaChart>
               </ResponsiveContainer>
             </div>
+          </div>
 
-            {/* Active mode quality metrics */}
-            <div className="h-72 rounded-xl border p-3">
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart
-                  data={series}
-                  margin={{ left: 0, right: 12, top: 10, bottom: 0 }}
-                >
-                  <CartesianGrid strokeDasharray="3 3" />
-                  <XAxis dataKey="t" tick={{ fontSize: 11 }} minTickGap={24} />
-                  <YAxis tick={{ fontSize: 11 }} />
-                  <Tooltip />
-                  <Legend />
-                  <Line
-                    type="monotone"
-                    dataKey="p95"
-                    name="p95 (ms) [active]"
-                    strokeWidth={2}
-                    dot={false}
-                  />
-                  <Line
-                    type="monotone"
-                    dataKey="cpu"
-                    name="CPU (%) [active]"
-                    strokeWidth={2}
-                    dot={false}
-                  />
-                  <Line
-                    type="monotone"
-                    dataKey="errors"
-                    name="Errors (%) [active]"
-                    strokeWidth={2}
-                    dot={false}
-                  />
-                </LineChart>
-              </ResponsiveContainer>
+          <div className="rounded-3xl border bg-white p-5 shadow-sm">
+            <h2 className="text-lg font-semibold">Recent events</h2>
+            <p className="mt-1 text-sm text-slate-600">
+              Scaling decisions and CloudWatch-observed replica changes.
+            </p>
+
+            <div className="mt-4 max-h-80 space-y-3 overflow-y-auto pr-2">
+              {events.length === 0 ? (
+                <div className="rounded-2xl border border-dashed p-4 text-sm text-slate-500">
+                  Waiting for CloudWatch metrics…
+                </div>
+              ) : (
+                events.map((event, index) => (
+                  <EventRow key={index} event={event} />
+                ))
+              )}
+            </div>
+          </div>
+        </section>
+
+        <section className="grid grid-cols-1 gap-5 xl:grid-cols-3">
+          <ComparisonPanel title="Traditional threshold" tone="neutral">
+            <MetricRow
+              label="Avg p95 latency"
+              value={`${Math.round(comparison?.avgP95Threshold ?? 0)} ms`}
+            />
+            <MetricRow
+              label="Avg errors"
+              value={`${(comparison?.avgErrThreshold ?? 0).toFixed(2)}%`}
+            />
+            <MetricRow
+              label="SLA risk points"
+              value={`${comparison?.slaRiskThreshold ?? 0}`}
+            />
+            <MetricRow
+              label="Avg spend"
+              value={`$${(comparison?.avgCostThreshold ?? 0).toFixed(2)}/hr`}
+            />
+          </ComparisonPanel>
+
+          <ComparisonPanel title="AI predictive" tone="success">
+            <MetricRow
+              label="Avg p95 latency"
+              value={`${Math.round(comparison?.avgP95Predictive ?? 0)} ms`}
+            />
+            <MetricRow
+              label="Avg errors"
+              value={`${(comparison?.avgErrPredictive ?? 0).toFixed(2)}%`}
+            />
+            <MetricRow
+              label="SLA risk points"
+              value={`${comparison?.slaRiskPredictive ?? 0}`}
+            />
+            <MetricRow
+              label="Avg spend"
+              value={`$${(comparison?.avgCostPredictive ?? 0).toFixed(2)}/hr`}
+            />
+          </ComparisonPanel>
+
+          <ComparisonPanel title="Decision summary" tone="accent">
+            <MetricRow
+              label="Latency change"
+              value={formatPct(comparison?.latencyImprovement ?? 0)}
+              icon={(comparison?.latencyImprovement ?? 0) >= 0 ? "up" : "down"}
+            />
+            <MetricRow
+              label="Error change"
+              value={formatPct(comparison?.errorImprovement ?? 0)}
+              icon={(comparison?.errorImprovement ?? 0) >= 0 ? "up" : "down"}
+            />
+            <MetricRow
+              label="Cost savings"
+              value={formatPct(comparison?.costSavings ?? 0)}
+              icon={(comparison?.costSavings ?? 0) >= 0 ? "up" : "down"}
+            />
+            <MetricRow
+              label="Cost tradeoff"
+              value={formatUsd(comparison?.costDelta ?? 0)}
+            />
+            <div className="rounded-2xl border bg-slate-50 px-4 py-3 text-sm leading-5 text-slate-700">
+              {comparison?.summary ?? "Waiting for enough CloudWatch samples."}
+            </div>
+          </ComparisonPanel>
+        </section>
+
+        <section className="rounded-3xl border bg-white p-5 shadow-sm">
+          <div className="mb-4 flex flex-col gap-1 md:flex-row md:items-end md:justify-between">
+            <div>
+              <h2 className="text-lg font-semibold">Active strategy health</h2>
+              <p className="text-sm text-slate-600">
+                Metrics update using the selected active strategy.
+              </p>
+            </div>
+
+            <div className="text-xs text-slate-500">
+              Metrics: <span className="font-mono">/api/cloudwatch</span> | AI:{" "}
+              <span className="font-mono">/api/predict</span> | Scale:{" "}
+              <span className="font-mono">/api/scale</span>
             </div>
           </div>
 
-          {/* Events + state */}
-          <div className="mt-6 grid grid-cols-1 gap-4 lg:grid-cols-3">
-            <div className="rounded-2xl border p-4">
-              <h3 className="text-sm font-semibold">Current State</h3>
-              <div className="mt-3 space-y-2 text-sm">
-                <Row
-                  label="Mode"
-                  value={
-                    mode === "predictive"
-                      ? "Predictive (AI)"
-                      : "Threshold (Baseline)"
-                  }
-                />
-                <Row label="CPU" value={`${kpis?.cpu ?? "–"}%`} />
-                <Row
-                  label="Error rate"
-                  value={`${(kpis?.errors ?? 0).toFixed(2)}%`}
-                />
-                <Row
-                  label="Estimated cost"
-                  value={`$${(kpis?.cost ?? 0).toFixed(2)}/hr`}
-                />
-              </div>
-            </div>
+          <div className="h-70 rounded-2xl border p-3">
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart
+                data={series}
+                margin={{ left: 2, right: 18, top: 10, bottom: 2 }}
+              >
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="t" tick={{ fontSize: 11 }} minTickGap={28} />
+                <YAxis tick={{ fontSize: 11 }} />
+                <Tooltip content={<ChartTooltip />} />
+                <Legend />
 
-            <div className="rounded-2xl border p-4 lg:col-span-2">
-              <h3 className="text-sm font-semibold">Recent Events</h3>
-
-              <div className="mt-3 space-y-2">
-                {events.length === 0 ? (
-                  <p className="text-sm text-gray-600">
-                    No events yet. Wait for the first spike.
-                  </p>
-                ) : (
-                  events.map((e, idx) => (
-                    <div
-                      key={idx}
-                      className="flex items-start gap-3 rounded-xl border p-3"
-                    >
-                      <div className="mt-0.5">
-                        {e.kind === "spike" ? (
-                          <Zap className="h-4 w-4" />
-                        ) : e.kind === "scale" ? (
-                          <Layers className="h-4 w-4" />
-                        ) : (
-                          <Activity className="h-4 w-4" />
-                        )}
-                      </div>
-                      <div className="min-w-0">
-                        <div className="text-xs text-gray-600">{e.ts}</div>
-                        <div className="text-sm font-medium wrap-break-word">
-                          {e.msg}
-                        </div>
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
+                <Line
+                  type="monotone"
+                  dataKey="active_p95"
+                  name="p95 latency (ms)"
+                  strokeWidth={2}
+                  dot={false}
+                  isAnimationActive
+                  animationDuration={700}
+                />
+                <Line
+                  type="monotone"
+                  dataKey="active_cpu"
+                  name="CPU (%)"
+                  strokeWidth={2}
+                  dot={false}
+                  isAnimationActive
+                  animationDuration={700}
+                />
+                <Line
+                  type="monotone"
+                  dataKey="memory_percent"
+                  name="Memory (%)"
+                  strokeWidth={2}
+                  dot={false}
+                  isAnimationActive
+                  animationDuration={700}
+                />
+                <Line
+                  type="monotone"
+                  dataKey="active_errors"
+                  name="Errors (%)"
+                  strokeWidth={2}
+                  dot={false}
+                  isAnimationActive
+                  animationDuration={700}
+                />
+              </LineChart>
+            </ResponsiveContainer>
           </div>
-
-          <p className="mt-6 text-xs text-gray-600">
-            Note: This is simulated data for UI/demo purposes. Replace the
-            generator with real metrics from CloudWatch/Prometheus later.
-          </p>
-        </div>
+        </section>
       </div>
-    </div>
+    </main>
   );
 }
 
-function Row({ label, value }: { label: string; value: string }) {
+function StatusPill({
+  children,
+  variant,
+}: {
+  children: React.ReactNode;
+  variant: "ok" | "warn" | "danger";
+}) {
+  const cls =
+    variant === "ok"
+      ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+      : variant === "warn"
+        ? "border-amber-200 bg-amber-50 text-amber-700"
+        : "border-red-200 bg-red-50 text-red-700";
+
   return (
-    <div className="flex items-center justify-between gap-3">
-      <span className="text-gray-600">{label}</span>
-      <span className="font-medium">{value}</span>
-    </div>
+    <span
+      className={`inline-flex items-center gap-2 rounded-full border px-3 py-2 text-sm font-medium ${cls}`}
+    >
+      <span className="h-2 w-2 rounded-full bg-current" />
+      {children}
+    </span>
   );
 }
 
@@ -1038,16 +1104,118 @@ function KpiCard({
   icon: React.ReactNode;
   label: string;
   value: string;
-  hint?: string;
+  hint: string;
 }) {
   return (
-    <div className="rounded-2xl border bg-white p-4 shadow-sm">
-      <div className="flex items-center gap-2 text-sm font-medium text-gray-800">
-        <span className="text-gray-500">{icon}</span>
-        {label}
+    <div className="rounded-3xl border bg-white p-5 shadow-sm transition hover:-translate-y-0.5 hover:shadow-md">
+      <div className="flex items-center justify-between gap-3">
+        <div className="text-sm font-medium text-slate-600">{label}</div>
+        <div className="rounded-xl bg-slate-100 p-2 text-slate-600">{icon}</div>
       </div>
-      <div className="mt-2 text-2xl font-semibold tracking-tight">{value}</div>
-      {hint ? <div className="mt-1 text-xs text-gray-600">{hint}</div> : null}
+      <div className="mt-3 text-3xl font-semibold tracking-tight">{value}</div>
+      <div className="mt-1 text-xs text-slate-500">{hint}</div>
+    </div>
+  );
+}
+
+function ComparisonPanel({
+  title,
+  tone,
+  children,
+}: {
+  title: string;
+  tone: "neutral" | "success" | "accent";
+  children: React.ReactNode;
+}) {
+  const icon =
+    tone === "success" ? (
+      <CheckCircle2 className="h-4 w-4" />
+    ) : tone === "accent" ? (
+      <TrendingUp className="h-4 w-4" />
+    ) : (
+      <Gauge className="h-4 w-4" />
+    );
+
+  return (
+    <div className="rounded-3xl border bg-white p-5 shadow-sm">
+      <div className="flex items-center gap-2 text-base font-semibold">
+        <span className="rounded-xl bg-slate-100 p-2 text-slate-600">
+          {icon}
+        </span>
+        {title}
+      </div>
+      <div className="mt-4 space-y-3">{children}</div>
+    </div>
+  );
+}
+
+function MetricRow({
+  label,
+  value,
+  icon,
+}: {
+  label: string;
+  value: string;
+  icon?: "up" | "down";
+}) {
+  return (
+    <div className="flex items-center justify-between gap-4 rounded-2xl border bg-slate-50 px-4 py-3">
+      <span className="text-sm text-slate-600">{label}</span>
+      <span className="inline-flex items-center gap-1 text-sm font-semibold text-slate-950">
+        {icon === "up" ? <ArrowUp className="h-3.5 w-3.5" /> : null}
+        {icon === "down" ? <ArrowDown className="h-3.5 w-3.5" /> : null}
+        {value}
+      </span>
+    </div>
+  );
+}
+
+function EventRow({ event }: { event: EventItem }) {
+  const icon =
+    event.kind === "ai" ? (
+      <Brain className="h-4 w-4" />
+    ) : event.kind === "threshold" ? (
+      <Gauge className="h-4 w-4" />
+    ) : event.kind === "scale" ? (
+      <Layers className="h-4 w-4" />
+    ) : event.kind === "cloudwatch" ? (
+      <Server className="h-4 w-4" />
+    ) : (
+      <Activity className="h-4 w-4" />
+    );
+
+  return (
+    <div className="flex max-w-full gap-3 rounded-2xl border bg-slate-50 p-3">
+      <div className="mt-0.5 shrink-0 rounded-xl bg-white p-2 text-slate-600">
+        {icon}
+      </div>
+      <div className="min-w-0 flex-1 overflow-hidden">
+        <div className="text-xs text-slate-500">{event.ts}</div>
+        <div className="text-sm leading-5 font-medium wrap-break-word text-slate-800">
+          {event.msg}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ChartTooltip({ active, payload, label }: any) {
+  if (!active || !payload?.length) return null;
+
+  return (
+    <div className="rounded-2xl border bg-white/95 p-3 text-sm shadow-lg backdrop-blur">
+      <div className="mb-2 font-semibold text-slate-900">{label}</div>
+      <div className="space-y-1">
+        {payload.map((item: any) => (
+          <div
+            key={item.dataKey}
+            className="flex items-center justify-between gap-6"
+          >
+            <span className="text-slate-600">{item.name}</span>
+            <span className="font-semibold text-slate-900">{item.value}</span>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
