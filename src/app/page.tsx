@@ -3,12 +3,10 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
-  AlertTriangle,
   ArrowDown,
   ArrowUp,
   Brain,
   CheckCircle2,
-  CircleDollarSign,
   Gauge,
   Layers,
   Pause,
@@ -58,12 +56,30 @@ type CloudWatchMetricResponse = {
   source?: string;
 };
 
+type ScaleStatus = {
+  ok: boolean;
+  namespace: string;
+  deployment: string;
+  desiredReplicas: number;
+  availableReplicas: number;
+  readyReplicas: number;
+  currentReplicas: number;
+  pods: {
+    name: string;
+    phase: string;
+    ready: boolean;
+    podIP?: string;
+    nodeName?: string;
+  }[];
+};
+
 type Point = {
   t: string;
   tsMs: number;
   rps: number;
   inst_threshold: number;
   inst_predictive: number;
+  inst_eks: number;
   cpu_threshold: number;
   cpu_predictive: number;
   p95_threshold: number;
@@ -131,17 +147,20 @@ function estimateErrors(cpu: number, p95: number) {
 }
 
 function projectHealth(metric: CloudWatchMetricResponse, pods: number) {
-  const currentPods = Math.max(1, metric.replicas || 1);
   const safePods = Math.max(1, pods);
-  const loadFactor = currentPods / safePods;
 
-  const projectedCpu = clamp(metric.cpu_percent * loadFactor, 2, 98);
+  // ALB requests/sec distributed across this strategy's pod count.
+  const loadPerPod = metric.requests / safePods;
+
+  const projectedCpu = clamp(metric.cpu_percent + loadPerPod * 0.35, 2, 95);
+
   const projectedP95 = Math.round(
     clamp(
-      metric.response_time_ms * Math.max(0.7, loadFactor) +
-        Math.max(0, projectedCpu - 65) * 6,
+      metric.response_time_ms +
+        loadPerPod * 2.2 +
+        Math.max(0, projectedCpu - 65) * 3,
       50,
-      2200,
+      1600,
     ),
   );
 
@@ -220,6 +239,23 @@ async function applyScale(replicas: number) {
   }
 }
 
+async function fetchScaleStatus(): Promise<ScaleStatus | null> {
+  try {
+    const res = await fetch("/api/scale", { cache: "no-store" });
+    const data = await res.json();
+
+    if (!res.ok || data.error) {
+      console.warn("Scale status API error:", data.error ?? res.statusText);
+      return null;
+    }
+
+    return data as ScaleStatus;
+  } catch (err) {
+    console.warn("Scale status API unreachable:", err);
+    return null;
+  }
+}
+
 export default function PredictiveAutoscalingDashboard() {
   const [mounted, setMounted] = useState(false);
   const [running, setRunning] = useState(true);
@@ -231,6 +267,8 @@ export default function PredictiveAutoscalingDashboard() {
   const [windowSize, setWindowSize] = useState(80);
   const [metricsOnline, setMetricsOnline] = useState(false);
   const [metricSource, setMetricSource] = useState("waiting");
+  const [eksStatus, setEksStatus] = useState<ScaleStatus | null>(null);
+  const [scaleBusy, setScaleBusy] = useState(false);
   const [lastPrediction, setLastPrediction] = useState<PredictionResponse>({
     recommended: null,
   });
@@ -246,6 +284,9 @@ export default function PredictiveAutoscalingDashboard() {
   const lastThresholdScaleAtRef = useRef(0);
   const lastObservedReplicasRef = useRef<number | null>(null);
   const lastAiRecommendationRef = useRef<number | null>(null);
+  const lastAiScaleAtRef = useRef(0);
+  const lowLoadTicksRef = useRef(0);
+  const highLoadTicksRef = useRef(0);
   const lastEventKeyRef = useRef("");
 
   useEffect(() => {
@@ -270,7 +311,7 @@ export default function PredictiveAutoscalingDashboard() {
 
   const logEvent = (kind: EventItem["kind"], msg: string) => {
     setEvents((prev) =>
-      [{ ts: formatTime(new Date()), kind, msg }, ...prev].slice(0, 10),
+      [{ ts: formatTime(new Date()), kind, msg }, ...prev].slice(0, 12),
     );
   };
 
@@ -279,6 +320,25 @@ export default function PredictiveAutoscalingDashboard() {
     if (lastEventKeyRef.current === key) return;
     lastEventKeyRef.current = key;
     logEvent(kind, msg);
+  };
+
+  const refreshScaleStatus = async () => {
+    const status = await fetchScaleStatus();
+    if (status?.ok) setEksStatus(status);
+    return status;
+  };
+
+  const requestManualScale = async (replicas: number) => {
+    setScaleBusy(true);
+    const result = await applyScale(replicas);
+    setScaleBusy(false);
+
+    if (result?.ok) {
+      logEvent("scale", `Manual /api/scale request: ${replicas} pods`);
+      await refreshScaleStatus();
+    } else {
+      logEvent("note", `Manual scale request failed for ${replicas} pods`);
+    }
   };
 
   const resetDashboard = () => {
@@ -291,6 +351,9 @@ export default function PredictiveAutoscalingDashboard() {
     lastThresholdScaleAtRef.current = 0;
     lastObservedReplicasRef.current = null;
     lastAiRecommendationRef.current = null;
+    lastAiScaleAtRef.current = 0;
+    lowLoadTicksRef.current = 0;
+    highLoadTicksRef.current = 0;
     lastEventKeyRef.current = "";
   };
 
@@ -310,6 +373,11 @@ export default function PredictiveAutoscalingDashboard() {
       }
 
       const metric = await fetchCloudWatchMetrics();
+      const scaleStatus = await fetchScaleStatus();
+
+      if (scaleStatus?.ok) {
+        setEksStatus(scaleStatus);
+      }
 
       if (!metric) {
         setMetricsOnline(false);
@@ -326,7 +394,12 @@ export default function PredictiveAutoscalingDashboard() {
 
       const MAX_REPLICAS = 5;
       const now = new Date(metric.timestamp).getTime() || Date.now();
-      const currentReplicas = clamp(metric.replicas || 1, 1, MAX_REPLICAS);
+      const nowMs = Date.now();
+      const currentReplicas = clamp(
+        scaleStatus?.currentReplicas ?? metric.replicas ?? 1,
+        1,
+        MAX_REPLICAS,
+      );
 
       if (
         lastObservedReplicasRef.current !== null &&
@@ -337,7 +410,7 @@ export default function PredictiveAutoscalingDashboard() {
 
         logEventOnce(
           "cloudwatch",
-          `CloudWatch observed scale ${direction}: ${lastObservedReplicasRef.current} → ${currentReplicas} pods`,
+          `Kubernetes observed scale ${direction}: ${lastObservedReplicasRef.current} → ${currentReplicas} pods`,
         );
       }
 
@@ -346,28 +419,22 @@ export default function PredictiveAutoscalingDashboard() {
       let instT = instancesRef.current.threshold;
       let instP = instancesRef.current.predictive;
 
-      // Only initialize from CloudWatch once. Do not overwrite the dashboard's
-      // predicted pod state every tick, otherwise repeated recommendations look like
-      // 1 → 3, 1 → 3, 1 → 3 even after the chart already moved to 3.
       if (instP < 1) {
         instP = currentReplicas;
       }
 
-      const thresholdProbe = projectHealth(metric, instT);
       let desiredT = instT;
-
-      const nowMs = Date.now();
-      const thresholdCooldownMs = 20_000;
+      const thresholdCooldownMs = 60_000;
 
       const thresholdHigh =
-        metric.cpu_percent > 65 ||
-        metric.response_time_ms > 450 ||
-        metric.requests > 120;
+        metric.cpu_percent > 85 ||
+        metric.response_time_ms > 900 ||
+        metric.requests > 240;
 
       const thresholdLow =
         metric.cpu_percent < 35 &&
-        metric.response_time_ms < 280 &&
-        metric.requests < 60;
+        metric.response_time_ms < 320 &&
+        metric.requests < 70;
 
       if (nowMs - lastThresholdScaleAtRef.current > thresholdCooldownMs) {
         if (thresholdHigh && instT < MAX_REPLICAS) {
@@ -423,7 +490,6 @@ export default function PredictiveAutoscalingDashboard() {
         }
       }
 
-      // SLA-aware guardrail: the model can be cost-conscious, but we prevent under-scaling.
       let safetyFloor = 1;
 
       if (avgRecentRps > 80 || metric.cpu_percent > 55 || trafficIsRising) {
@@ -453,35 +519,54 @@ export default function PredictiveAutoscalingDashboard() {
 
       desiredP = Math.max(desiredP, safetyFloor);
 
-      const recentLowLoad = historyRef.current
-        .slice(-4)
-        .every((item) => item.requests < 60);
+      const highLoad =
+        avgRecentRps >= 8 ||
+        metric.cpu_percent >= 55 ||
+        metric.response_time_ms >= 300;
 
-      if (
-        recentLowLoad &&
-        metric.cpu_percent < 40 &&
-        metric.response_time_ms < 350 &&
-        instP > 1
-      ) {
-        desiredP = clamp(instP - 1, 1, MAX_REPLICAS);
+      const lowLoad =
+        avgRecentRps <= 3 &&
+        metric.cpu_percent < 25 &&
+        metric.response_time_ms < 180;
+
+      if (highLoad) {
+        highLoadTicksRef.current += 1;
+        lowLoadTicksRef.current = 0;
+      } else if (lowLoad) {
+        lowLoadTicksRef.current += 1;
+        highLoadTicksRef.current = 0;
+      } else {
+        highLoadTicksRef.current = 0;
+        lowLoadTicksRef.current = 0;
+      }
+
+      const aiCooldownMs = 30_000;
+      const canAiChange = nowMs - lastAiScaleAtRef.current > aiCooldownMs;
+
+      if (desiredP > instP && highLoadTicksRef.current < 2) {
+        desiredP = instP;
+      }
+
+      if (desiredP < instP && lowLoadTicksRef.current < 6) {
+        desiredP = instP;
+      }
+
+      if (desiredP !== instP && !canAiChange) {
+        desiredP = instP;
       }
 
       if (desiredP !== instP) {
         const direction = desiredP > instP ? "scale up" : "scale down";
 
-        // Avoid repeating the same recommendation every poll.
-        if (lastAiRecommendationRef.current !== desiredP) {
-          logEvent(
-            "ai",
-            `AI recommends ${direction}: ${instP} → ${desiredP} pods`,
-          );
-          lastAiRecommendationRef.current = desiredP;
-        }
+        logEvent("ai", `AI decision ${direction}: ${instP} → ${desiredP} pods`);
+
+        lastAiRecommendationRef.current = desiredP;
+        lastAiScaleAtRef.current = nowMs;
       } else {
         lastAiRecommendationRef.current = instP;
       }
 
-      if (autoApplyRef.current && desiredP !== instP) {
+      if (autoApplyRef.current && desiredP !== currentReplicas) {
         const cooldownMs = 90_000;
 
         if (nowMs - lastScaleAtRef.current > cooldownMs) {
@@ -491,16 +576,20 @@ export default function PredictiveAutoscalingDashboard() {
             lastScaleAtRef.current = nowMs;
             logEvent(
               "scale",
-              `Applied AI scaling to EKS: replicas = ${desiredP}`,
+              `Requested EKS scale via /api/scale: ${currentReplicas} → ${desiredP} pods`,
             );
+            await refreshScaleStatus();
           } else {
             logEvent(
               "note",
-              "AI scaling was recommended, but /api/scale did not apply it",
+              "AI wanted to scale, but /api/scale did not apply the request",
             );
           }
         } else {
-          logEventOnce("note", "Scale skipped because cooldown is active");
+          logEventOnce(
+            "note",
+            "EKS scale request skipped because cooldown is active",
+          );
         }
       }
 
@@ -516,7 +605,7 @@ export default function PredictiveAutoscalingDashboard() {
       const active =
         modeRef.current === "predictive"
           ? {
-              instances: instP,
+              instances: currentReplicas,
               cpu: predictiveMetrics.cpu,
               p95: predictiveMetrics.p95,
               errors: predictiveMetrics.errors,
@@ -536,6 +625,7 @@ export default function PredictiveAutoscalingDashboard() {
         rps: metric.requests,
         inst_threshold: instT,
         inst_predictive: instP,
+        inst_eks: currentReplicas,
         cpu_threshold: thresholdMetrics.cpu,
         cpu_predictive: predictiveMetrics.cpu,
         p95_threshold: thresholdMetrics.p95,
@@ -580,11 +670,11 @@ export default function PredictiveAutoscalingDashboard() {
     const avgCostPredictive = avg(slice.map((p) => p.cost_predictive));
 
     const slaRiskThreshold = slice.filter(
-      (p) => p.p95_threshold > 800 || p.errors_threshold > 1,
+      (p) => p.p95_threshold > 1000 || p.errors_threshold > 1,
     ).length;
 
     const slaRiskPredictive = slice.filter(
-      (p) => p.p95_predictive > 800 || p.errors_predictive > 1,
+      (p) => p.p95_predictive > 1000 || p.errors_predictive > 1,
     ).length;
 
     const latencyImprovement =
@@ -605,18 +695,21 @@ export default function PredictiveAutoscalingDashboard() {
 
     const slaRiskReduction = slaRiskThreshold - slaRiskPredictive;
 
-    const score =
-      costSavings * 0.45 +
-      latencyImprovement * 0.3 +
-      errorImprovement * 0.15 +
-      slaRiskReduction * 2;
+    let summary = "Waiting for enough CloudWatch samples.";
 
-    const summary =
-      latencyImprovement >= 0 && errorImprovement >= 0
-        ? "AI is improving performance while controlling cost."
-        : costSavings > 0
-          ? "AI is saving cost, but the model is more conservative on SLA."
-          : "Threshold is currently performing better; tune AI guardrails or retrain.";
+    if (costSavings > 0 && latencyImprovement >= 0 && errorImprovement >= 0) {
+      summary = "AI is improving performance while reducing cost.";
+    } else if (costSavings > 0) {
+      summary = "AI is reducing cost, with a small performance tradeoff.";
+    } else if (latencyImprovement > 0 || errorImprovement > 0) {
+      summary =
+        "AI is scaling earlier to reduce SLA risk, but it costs slightly more.";
+    } else if (costSavings < 0) {
+      summary =
+        "AI is using more capacity to reduce latency and protect the SLA during traffic spikes.";
+    } else {
+      summary = "Both strategies are currently performing similarly.";
+    }
 
     return {
       avgP95Threshold,
@@ -632,7 +725,6 @@ export default function PredictiveAutoscalingDashboard() {
       slaRiskReduction,
       slaRiskThreshold,
       slaRiskPredictive,
-      score,
       summary,
     };
   }, [series]);
@@ -674,10 +766,10 @@ export default function PredictiveAutoscalingDashboard() {
               </h1>
 
               <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">
-                Live CloudWatch/EKS metrics are sent to the AI model. The
-                dashboard compares a threshold baseline against an SLA-aware AI
-                policy and can apply the AI replica decision to a Kubernetes
-                Deployment.
+                Live ALB, CloudWatch, and EKS metrics are sent to the AI model.
+                The dashboard separates AI decisions from the real Kubernetes
+                deployment state and can request scale changes through{" "}
+                <span className="font-mono">/api/scale</span>.
               </p>
             </div>
 
@@ -758,8 +850,22 @@ export default function PredictiveAutoscalingDashboard() {
                 checked={autoApply}
                 onChange={(e) => setAutoApply(e.target.checked)}
               />
-              Apply AI scaling to EKS
+              Auto request EKS scale via /api/scale
             </label>
+
+            <div className="inline-flex flex-wrap items-center gap-2 rounded-xl border bg-white px-3 py-2 text-sm font-medium">
+              <span className="text-slate-500">Manual EKS scale</span>
+              {[1, 2, 3, 4, 5].map((replica) => (
+                <button
+                  key={replica}
+                  disabled={scaleBusy}
+                  onClick={() => requestManualScale(replica)}
+                  className="rounded-lg border px-2 py-1 text-xs hover:bg-slate-100 disabled:opacity-50"
+                >
+                  {replica}
+                </button>
+              ))}
+            </div>
 
             <div className="ml-auto text-xs text-slate-500">
               Source:{" "}
@@ -768,12 +874,12 @@ export default function PredictiveAutoscalingDashboard() {
           </div>
         </section>
 
-        <section className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-6">
+        <section className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-7">
           <KpiCard
             icon={<Activity className="h-4 w-4" />}
-            label="Requests"
+            label="Requests/sec"
             value={`${latest?.rps ?? "–"}`}
-            hint="CloudWatch samples"
+            hint="ALB RequestCount"
           />
           <KpiCard
             icon={<Gauge className="h-4 w-4" />}
@@ -788,10 +894,16 @@ export default function PredictiveAutoscalingDashboard() {
             hint="pod memory"
           />
           <KpiCard
-            icon={<Layers className="h-4 w-4" />}
-            label="AI pods"
+            icon={<Brain className="h-4 w-4" />}
+            label="AI decision"
             value={`${latest?.inst_predictive ?? "–"}`}
             hint={`raw: ${lastPrediction.raw ? lastPrediction.raw.toFixed(2) : "waiting"}`}
+          />
+          <KpiCard
+            icon={<Layers className="h-4 w-4" />}
+            label="Current EKS pods"
+            value={`${eksStatus?.currentReplicas ?? latest?.inst_eks ?? "–"}`}
+            hint={`${eksStatus?.readyReplicas ?? 0} ready / ${eksStatus?.availableReplicas ?? 0} available`}
           />
           <KpiCard
             icon={<ShieldCheck className="h-4 w-4" />}
@@ -812,11 +924,12 @@ export default function PredictiveAutoscalingDashboard() {
             <div className="mb-4 flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
               <div>
                 <h2 className="text-lg font-semibold">
-                  CloudWatch traffic and pod scaling
+                  ALB traffic and Kubernetes pod scaling
                 </h2>
                 <p className="mt-1 text-sm text-slate-600">
-                  Gray area shows request pressure. Solid blue shows AI pods.
-                  Dashed orange shows threshold pods.
+                  Gray area shows ALB requests/sec. Blue shows AI decision.
+                  Green shows current EKS pods. Dashed orange shows threshold
+                  baseline.
                 </p>
               </div>
 
@@ -849,7 +962,7 @@ export default function PredictiveAutoscalingDashboard() {
                     yAxisId="rps"
                     tick={{ fontSize: 11 }}
                     label={{
-                      value: "Requests",
+                      value: "Requests/sec",
                       angle: -90,
                       position: "insideLeft",
                     }}
@@ -875,7 +988,7 @@ export default function PredictiveAutoscalingDashboard() {
                     yAxisId="rps"
                     type="monotone"
                     dataKey="rps"
-                    name="Requests"
+                    name="Requests/sec"
                     stroke="#94a3b8"
                     fill="#94a3b8"
                     fillOpacity={0.18}
@@ -888,7 +1001,7 @@ export default function PredictiveAutoscalingDashboard() {
                     yAxisId="instances"
                     type="stepAfter"
                     dataKey="inst_predictive"
-                    name="AI pods"
+                    name="AI decision"
                     stroke="#2563eb"
                     strokeWidth={3}
                     dot={false}
@@ -899,8 +1012,20 @@ export default function PredictiveAutoscalingDashboard() {
                   <Line
                     yAxisId="instances"
                     type="stepAfter"
+                    dataKey="inst_eks"
+                    name="Current EKS pods"
+                    stroke="#16a34a"
+                    strokeWidth={3}
+                    dot={false}
+                    isAnimationActive
+                    animationDuration={700}
+                  />
+
+                  <Line
+                    yAxisId="instances"
+                    type="stepAfter"
                     dataKey="inst_threshold"
-                    name="Threshold pods"
+                    name="Threshold baseline"
                     stroke="#f97316"
                     strokeWidth={3}
                     strokeDasharray="6 4"
@@ -916,7 +1041,8 @@ export default function PredictiveAutoscalingDashboard() {
           <div className="rounded-3xl border bg-white p-5 shadow-sm">
             <h2 className="text-lg font-semibold">Recent events</h2>
             <p className="mt-1 text-sm text-slate-600">
-              Scaling decisions and CloudWatch-observed replica changes.
+              AI decisions, /api/scale requests, and Kubernetes-observed
+              changes.
             </p>
 
             <div className="mt-4 max-h-80 space-y-3 overflow-y-auto pr-2">
@@ -930,6 +1056,74 @@ export default function PredictiveAutoscalingDashboard() {
                 ))
               )}
             </div>
+          </div>
+        </section>
+
+        <section className="rounded-3xl border bg-white p-5 shadow-sm">
+          <div className="mb-4 flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
+            <div>
+              <h2 className="text-lg font-semibold">Current EKS pods</h2>
+              <p className="text-sm text-slate-600">
+                Real Kubernetes deployment status from{" "}
+                <span className="font-mono">/api/scale</span>.
+              </p>
+            </div>
+
+            <div className="text-sm text-slate-500">
+              Desired:{" "}
+              <span className="font-semibold text-slate-900">
+                {eksStatus?.desiredReplicas ?? "–"}
+              </span>{" "}
+              · Ready:{" "}
+              <span className="font-semibold text-slate-900">
+                {eksStatus?.readyReplicas ?? "–"}
+              </span>{" "}
+              · Available:{" "}
+              <span className="font-semibold text-slate-900">
+                {eksStatus?.availableReplicas ?? "–"}
+              </span>
+            </div>
+          </div>
+
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+            {(eksStatus?.pods ?? []).length === 0 ? (
+              <div className="rounded-2xl border border-dashed p-4 text-sm text-slate-500">
+                Waiting for Kubernetes pod status…
+              </div>
+            ) : (
+              eksStatus!.pods.map((pod) => (
+                <div
+                  key={pod.name}
+                  className="rounded-2xl border bg-slate-50 p-4"
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-semibold text-slate-900">
+                        {pod.name}
+                      </div>
+                      <div className="mt-1 text-xs text-slate-500">
+                        {pod.nodeName ?? "unknown node"}
+                      </div>
+                    </div>
+
+                    <span
+                      className={`rounded-full px-2 py-1 text-xs font-medium ${
+                        pod.ready
+                          ? "bg-emerald-50 text-emerald-700"
+                          : "bg-amber-50 text-amber-700"
+                      }`}
+                    >
+                      {pod.ready ? "Ready" : pod.phase}
+                    </span>
+                  </div>
+
+                  <div className="mt-3 text-xs text-slate-500">
+                    Pod IP:{" "}
+                    <span className="font-mono">{pod.podIP ?? "–"}</span>
+                  </div>
+                </div>
+              ))
+            )}
           </div>
         </section>
 
